@@ -287,6 +287,8 @@ function logCommand(c) {
 
 async function stopRecording() {
   if (!recorder) return;
+  // Stopped (by voice, or Chrome's "Stop sharing") before the countdown ended.
+  if (!$('countdown').hidden) return cancelCountdown();
   const r = recorder;
   recorder = null;
   clearInterval(hudTimer);
@@ -561,7 +563,7 @@ function renderNotes() {
       sw.append(box, track);
       sw.addEventListener('click', (e) => e.stopPropagation());
       box.addEventListener('change', () => {
-        state.disabled = box.checked ? state.disabled.filter((d) => d !== c.id) : [...state.disabled, c.id];
+        state.disabled = box.checked ? [...state.disabled.filter((d) => d !== c.id), `on:${c.id}`] : [...state.disabled.filter((d) => d !== `on:${c.id}`), c.id];
         rebuild();
         toast(box.checked ? `Back on: ${describe(c)}` : `Undone: ${describe(c)}`);
       });
@@ -812,6 +814,107 @@ function lookChanged() {
   state.player?.paint();
 }
 
+/**
+ * The live take on the home page: a looping example of narration, a fumble,
+ * a secret and a zoom, and what Retake does about each, as it would happen.
+ */
+function heroDemo() {
+  const list = $('td-lines'), clock = $('td-time');
+  if (!list) return;
+  /** @type {({say: string, secret?: string, fumble?: boolean} | {cmd: string, did: string, act?: 'strike' | 'blur' | 'zoom'})[]} */
+  const beats = [
+    { say: 'So first we open the uh… the setting thingy', fumble: true },
+    { cmd: 'scratch that', did: 'Cut 4.2s, and the stumble with it', act: 'strike' },
+    { say: 'First, open Settings.' },
+    { say: 'Paste your API key here:', secret: 'sk_live_9fQ2xT7c' },
+    { cmd: 'hide that', did: 'Blurred from the moment it appeared', act: 'blur' },
+    { say: 'Now the chart updates live.' },
+    { cmd: 'zoom in', did: '2× on the chart, glides back on “zoom out”', act: 'zoom' },
+  ];
+  const still = matchMedia('(prefers-reduced-motion: reduce)').matches;
+  let t = 0, timer = 0;
+  const wait = (/** @type {number} */ ms) => new Promise((r) => (timer = window.setTimeout(r, ms)));
+  const tick = () => (clock.textContent = fmt(t));
+  /** @param {HTMLElement} li @param {string} text */
+  const typeIn = async (li, text) => {
+    const line = document.createElement('span');
+    line.className = 'said';
+    li.append(line);
+    const spans = text.split(' ').map((w) => {
+      const sp = document.createElement('span');
+      sp.className = 'w';
+      sp.textContent = `${w} `;
+      line.append(sp);
+      return sp;
+    });
+    for (const sp of spans) {
+      if (!still) await wait(85);
+      sp.classList.add('on');
+    }
+  };
+  const run = async () => {
+    for (;;) {
+      list.replaceChildren();
+      t = 3;
+      tick();
+      /** @type {HTMLLIElement | null} */
+      let lastSaid = null;
+      for (const b of beats) {
+        const li = document.createElement('li');
+        list.append(li);
+        // Keep the card to the latest few lines.
+        const shown = [...list.children].filter((x) => !x.classList.contains('gone'));
+        if (shown.length > 5) {
+          shown[0].classList.add('gone');
+          const old = shown[0];
+          setTimeout(() => old.remove(), 600);
+        }
+        if ('say' in b) {
+          await typeIn(li, b.say);
+          if (b.secret) {
+            const sec = document.createElement('span');
+            sec.className = 'secret';
+            sec.textContent = b.secret;
+            /** @type {HTMLElement} */ (li.lastElementChild).append(sec);
+          }
+          lastSaid = li;
+          t += 2 + Math.round(b.say.length / 14);
+        } else {
+          li.className = 'cmd';
+          const q = document.createElement('span');
+          q.className = 'q';
+          q.textContent = `“${b.cmd}”`;
+          const did = document.createElement('span');
+          did.className = 'did';
+          did.textContent = b.did;
+          li.append(q);
+          if (!still) await wait(450);
+          li.append(did);
+          const target = lastSaid;
+          if (b.act === 'strike' && target) {
+            target.classList.add('struck');
+            if (!still) await wait(900);
+            target.classList.add('gone');
+            setTimeout(() => target.remove(), 600);
+          }
+          if (b.act === 'blur') target?.querySelector('.secret')?.classList.add('blurred');
+          if (b.act === 'zoom') target?.classList.add('zoomed');
+          t += 1;
+        }
+        tick();
+        if (!still) await wait(1100);
+      }
+      if (still) return;
+      await wait(2600);
+      list.classList.add('fading');
+      await wait(400);
+      list.classList.remove('fading');
+    }
+  };
+  run();
+  return () => clearTimeout(timer);
+}
+
 async function init() {
   renderVocab();
   setPlaying(false);
@@ -823,6 +926,7 @@ async function init() {
   if (!canRecord()) note('support-note', 'Recording needs Chrome, Edge or Firefox on a computer. You can still try the sample take.');
   else if (!canTranscribe()) note('support-note', 'This browser can record, but only Chrome and Edge can hear your commands.');
 
+  heroDemo();
   $('record').addEventListener('click', startRecording);
   $('stop').addEventListener('click', stopRecording);
   $('pop-out').addEventListener('click', floatCamera);

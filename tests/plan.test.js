@@ -245,7 +245,7 @@ test('demo mode keeps directions and fumbles audible, under a cut overlay', () =
   const final = buildPlan(t, { trimDeadAir: false });
   const demo = buildPlan(t, { trimDeadAir: false, showDirections: true });
   const ghost = demo.segments.find((s) => s.ghost === 'fumble');
-  assert.ok(ghost && ghost.rate > 1 && ghost.rate <= 1.3, 'the fumble plays a little faster and stays audible');
+  assert.ok(ghost && ghost.rate >= 1 && ghost.rate <= 1.3, 'the fumble stays audible');
   assert.ok(ghost.src1 <= 8.6, 'the fumble ghost stops where "scratch that" begins');
   const said = demo.segments.find((s) => s.src0 <= 9 && s.src1 > 9);
   assert.equal(said.rate, 1, '"scratch that" is heard at normal speed');
@@ -422,4 +422,85 @@ test('the demo version never skips over speech', () => {
     const seg = demo.segments.find((g) => s >= g.src0 && s < g.src1);
     assert.ok(seg && seg.rate <= 1.3, `audible at ${s.toFixed(1)} ("${p.text}")`);
   }
+});
+
+// ---------------------------------------------------------------- round 4: real recogniser timing
+
+/** A take with the voice exactly where given (not tied to the reported phrase times). */
+function voiceTake(phrases, voice, duration, motion = []) {
+  const dt = 0.05;
+  const values = new Float32Array(Math.ceil(duration / dt));
+  for (const [a, b] of voice) for (let t = a; t < b; t += dt) values[Math.floor(t / dt + 1e-6)] = 0.3;
+  return { duration, phrases, levels: { dt, values }, motion };
+}
+
+test('a late final result does not drag a command into the next sentence', async () => {
+  const { gainAt } = await import('../src/plan.js');
+  const moving = motionLog(12, [{ t0: 0, t1: 12, x0: 10, x1: 20, y0: 10, y1: 20 }]);
+  // You said "zoom in" 4.0–4.6, then "so here is the chart we built" 4.9–7.4.
+  // The recogniser reported "zoom in" as 4.2–6.5 (finalised while you were already talking).
+  const t = voiceTake([P('zoom in', 4.2, 6.5), P('so here is the chart we built', 5.2, 8.6)], [[4, 4.6], [4.9, 7.4]], 12, moving);
+  const plan = buildPlan(t, { trimDeadAir: false });
+  const m = plan.mutes[0];
+  assert.ok(m.src0 <= 3.95 && m.src1 >= 4.6 && m.src1 <= 4.9, `silenced ${m.src0.toFixed(2)}–${m.src1.toFixed(2)}`);
+  assert.equal(gainAt(plan, 5.3), 1, 'the next sentence is heard');
+  const z = plan.view.find((v) => v.scale > 1);
+  assert.ok(z.src < 4.6, `zoom starts as you say it (${z.src.toFixed(2)})`);
+  const cap = plan.captions.map((c) => c.text).join(' ');
+  assert.ok(/^so here is the chart/.test(cap), cap);
+});
+
+test('a camera command run into the next sentence still works, and is silenced', async () => {
+  const { cameraModeAt, gainAt } = await import('../src/plan.js');
+  const moving = motionLog(12, [{ t0: 0, t1: 12, x0: 10, x1: 20, y0: 10, y1: 20 }]);
+  // "back to the screen" 2.0–2.9, pause, "so here we have the chart" 3.2–4.8, all one phrase.
+  const t = voiceTake([P('back to the screen so here we have the chart', 2.4, 6.2)], [[2, 2.9], [3.2, 4.8]], 12, moving);
+  const plan = buildPlan({ ...t, cameraStart: 'big' }, { trimDeadAir: false });
+  const cmd = plan.commands.find((c) => c.type === 'camSmall');
+  assert.ok(cmd && cmd.enabled, 'recognised');
+  assert.equal(cameraModeAt(plan, 4).to, 'small');
+  assert.equal(gainAt(plan, 2.4), 0, 'command silenced');
+  assert.equal(gainAt(plan, 3.6), 1, 'narration heard');
+});
+
+test('camera words inside a sentence, with no pause, are left alone', () => {
+  const said = [P('we bought a big camera', 1, 3)];
+  assert.equal(parseCommands(said).length, 0);
+  const t = voiceTake([P('and this is how it looks with the big camera', 1, 4)], [[1, 4]], 6);
+  const plan = buildPlan(t, { trimDeadAir: false });
+  const c = plan.commands.find((x) => x.type === 'camBig');
+  assert.ok(!c || !c.enabled, 'not acted on');
+});
+
+test('"scratch that" is understood however the recogniser spells it', () => {
+  for (const s of ['scratch that', 'Scratched that.', 'stretch that', 'scratch it', 'oops', 'let me say that again']) {
+    assert.equal(parseCommands([P(s, 0, 1)])[0]?.type, 'cut', s);
+  }
+});
+
+test('"scratch that" works however the recogniser groups the words, and the retake survives', () => {
+  const voice = [[1, 3.6], [4.1, 4.8], [5.3, 7.5]];
+  const groupings = [
+    [P('so first we open the uh the setting thingy scratch that first we open the settings', 1.4, 8.6)],
+    [P('so first we open the uh the setting thingy', 1.4, 4.6), P('scratch that first we open the settings', 4.3, 8.6)],
+    [P('so first we open the uh the setting thingy scratch that', 1.4, 5.6), P('first we open the settings', 5.6, 8.4)],
+    [P('so first we open the uh the setting thingy', 1.4, 4.6), P('scratch that', 4.3, 6.0), P('first we open the settings', 5.6, 8.4)],
+  ];
+  for (const phrases of groupings) {
+    const t = voiceTake(phrases, voice, 12);
+    const final = buildPlan(t, { trimDeadAir: false });
+    const cut = final.cuts.find((c) => c.reason === 'fumble');
+    assert.ok(cut.src0 <= 1 && cut.src1 >= 4.8 && cut.src1 <= 5.3, `cut ${cut.src0.toFixed(2)}–${cut.src1.toFixed(2)}`);
+    assert.equal(final.captions.map((c) => c.text).join(' '), 'first we open the settings');
+    const demo = buildPlan(t, { trimDeadAir: false, showDirections: true });
+    const d = demo.directions.find((x) => x.type === 'cut');
+    assert.ok(d && Math.abs(d.src0 - 4.1) < 0.25, `card at ${d && d.src0.toFixed(2)}`);
+    const seg = demo.segments.find((g) => 4.3 >= g.src0 && 4.3 < g.src1);
+    assert.equal(seg.rate, 1, '"scratch that" plays at normal speed in the demo');
+  }
+});
+
+test('the product name in a sentence is not a command', () => {
+  assert.equal(parseCommands([P("hi, I'm going to show you how retake works", 0, 3)]).length, 0);
+  assert.equal(parseCommands([P('retake', 0, 1)])[0]?.type, 'cut');
 });

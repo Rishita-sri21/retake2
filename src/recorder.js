@@ -239,19 +239,20 @@ export class Recorder {
       this.camChunks = [];
       this.camRec.ondataavailable = (e) => e.data.size && this.camChunks?.push(e.data);
       camStarted = new Promise((res) => {
-        /** @type {MediaRecorder} */ (this.camRec).onstart = () => {
-          this.camT0 = performance.now();
-          res(undefined);
-        };
+        /** @type {MediaRecorder} */ (this.camRec).onstart = () => res(undefined);
       });
+      this.camT0 = performance.now();
       this.camRec.start(1000);
     }
-    this.rec.start(1000);
-    await started;
-    if (camStarted) await camStarted;
+    // Zero every clock at the moment the recording starts. (Taking it after
+    // the 'start' event, as before, put the mic and speech timeline ~50–150ms
+    // behind the video, so the end of a silenced command could be heard.)
     this.t0 = performance.now();
     this.audioT0 = actx.currentTime;
     this.running = true;
+    this.rec.start(1000);
+    await started;
+    if (camStarted) await camStarted;
 
     this.startMotion(video);
   }
