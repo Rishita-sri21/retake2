@@ -2,7 +2,7 @@
 
 **A screen recorder you direct out loud.**
 
-Record your screen and talk as you normally would. Fumble a sentence? Say **"scratch that"** and it's gone. Something too small to read? Say **"zoom here"**. Pasted an API key on screen? Say **"hide that"** and it's blurred from the moment it appeared. Stop recording, and the video is already edited, captioned and split into chapters.
+Record your screen and talk as you normally would. Fumble a sentence? Say **"scratch that"** and it's gone. Something too small to read? Say **"zoom in"**. Pasted an API key on screen? Say **"hide that"** and it's blurred from the moment it appeared. Stop recording, and the video is already edited, captioned and split into chapters.
 
 No timeline. No editing session. No upload: everything happens in your browser.
 
@@ -21,17 +21,23 @@ Existing tools fix this **after** recording: you scrub a timeline, or an AI gues
 | Say | Retake |
 |---|---|
 | **"scratch that"** | Cuts the sentence you just fumbled, and what happened on screen while you said it. If you said it mid-sentence, only that breath is cut. |
-| **"hide that"** | Finds what just appeared on screen and pixelates it **from the moment it first appeared** (before you noticed) **until it leaves the screen**. |
-| **"zoom here"** / **"zoom out"** | Smoothly zooms into the area of the screen that just changed, then eases back out. |
+| **"cut the last two sentences"** / **"cut the last sentence"** | Cuts exactly that many sentences before the command. |
+| **"cut the last 5 seconds"** | Cuts exactly that much time before the command. |
+| **"cut from here"** … **"cut till here"** | Cuts everything between the two. |
+| **"hide that"** | Finds what just appeared on screen and pixelates it **from the moment it first appeared** (before you noticed) **until it leaves the screen**, or until you say **"show it"**. **"hide that for ten seconds"** sets the length. |
+| **"hide the screen"** / **"show the screen"** | Blurs the whole screen, e.g. while you open your inbox. |
+| **"zoom in"** / **"zoom out"** | Glides to 2× on the centre, and back to the full screen, whatever is on screen. **"zoom in on the top right"** aims at a corner or side, **"zoom in more"** goes closer, **"zoom in for 3 seconds"** zooms back out on its own. |
 | **"look here"** | Dims the screen and rings what just changed, for three seconds. |
-| **"speed this up"** / **"normal speed"** | Fast-forwards the boring part (installs, builds, uploads) at 2×, 4× or 8×, with an on-screen badge. |
+| **"speed this up"** / **"normal speed"** | Fast-forwards the boring part (installs, builds, uploads). **"speed this up 8x"** sets the rate. |
+| **"pause"** / **"resume"** | Pauses the recording; nothing is recorded until you say "resume", and the join dissolves softly. |
+| **"stop recording"** | Ends the take and opens the editor. The command itself is left out. |
 | **"chapter: setup"** | Adds a chapter card on screen and a YouTube timestamp. |
 | **"title: my project"** | Opens the video with a title card. |
 | **"mark that"** | Drops a bookmark. |
 | **"big camera"** / **"small camera"** | Grows your camera bubble to fill the frame (intros, outros), then sends it back to its corner. |
 | **"hide camera"** / **"show camera"** | Gets your face out of the way when it covers something on screen. |
 
-Hinglish and Hindi work too: *kaat do*, *chhupa do*, *zoom karo*, *tez karo*, *अध्याय: …*.
+Hinglish and Hindi work too: *kaat do*, *chhupa do*, *zoom karo*, *tez karo*, *ruko*, *अध्याय: …*.
 
 And without being asked:
 
@@ -39,8 +45,9 @@ And without being asked:
 - **Dead air is trimmed**, but only where nothing happens on screen. If you're silent because you're typing, it's kept.
 - **Captions** are burned in and exported as `.srt` / `.vtt`, with your directions removed from them.
 - **YouTube chapters** are generated, with a warning if they don't meet YouTube's rules.
-- **Live slate with your camera:** a 3-2-1 countdown (Retake is already listening, so "big camera" works from the first word), then a slate showing your camera preview, a timer, a mic level, what Retake heard, and each command as it lands. It can float above other windows.
-- **Smooth cuts:** every cut is snapped to a silence, crossfaded over a third of a second, and the audio is ramped so there are no clicks.
+- **Live slate with your camera:** a 3-2-1 countdown (Retake is already listening, so "big camera" works from the first word), then a slate showing your camera preview, a timer, a mic level, what Retake heard, each command as it lands, and a pause button.
+- **Float my camera:** pops just your camera bubble out above every other window, so you can see yourself while you work. If you're recording the whole screen, Retake remembers where you dragged it and the bubble in the video follows.
+- **A final cut that doesn't feel cut.** Phrase timing from speech recognition is re-measured against the mic's loudness, so cuts land in real silences. Spoken commands are **silenced, not cut**, when something is happening on screen (so a zoom or a camera change isn't chopped out), and cut when the screen is still. You can choose Smart, Silence or Cut in Style. Every cut dissolves over 450ms with an eased audio ramp, and camera changes start as you say them.
 - **Three versions of every take:** **Final** (what viewers get), **Demo** (your spoken commands stay in, each labelled with what Retake did, and the parts that would be cut play fast under a red overlay, which is ideal for showing Retake off) and **Raw**. Any of them can be exported.
 - **Nothing is final:** every direction appears in the Director's notes with a switch to undo it, and a **Raw take** toggle shows the original for comparison.
 - **Private:** recording, speech recognition (Chrome's built-in), analysis and rendering all run in the browser. The last take is kept in this browser so a refresh doesn't lose it.
@@ -81,14 +88,15 @@ flowchart LR
 
 - **"scratch that"** cuts from the start of the fumbled sentence, snapped to the silence before it, to the end of the command.
 - **"hide that"** looks back for the most recent burst of screen change. It ignores tiny changes such as a moving mouse or a blinking caret, takes the main region the burst touched, and starts the blur at the moment that region began changing. The blur ends when most of that region changes again (a tab switch, a scroll).
-- **"zoom here"** aims at the busiest region of the last few seconds, weighted towards the most recent, and ranked by area so a blinking caret never wins.
+- **"zoom in"** glides to the centre, or to the named region, so it does the same thing every time, whatever is on screen.
+- **Spoken commands** become silences or cuts depending on whether the screen was moving while you said them.
 - **Dead air** is shortened only when the mic is quiet *and* the screen is static.
 
 The result is a list of segments (with speed), zooms, blurs, spotlights, chapters and captions, plus exact source↔output time mapping.
 
 The plan is rebuilt from scratch whenever you flip a switch or change a setting, so editing is non-destructive. **The renderer** (`src/render.js`) draws each output frame from the plan: the virtual camera with eased zoom, pixelation, spotlight, cards, badge and captions. The preview and the export share it, so what you see is what you get. Export records the canvas in real time with the original audio, pausing the recorder while the video seeks across a cut so no frozen frames get in.
 
-**Type:** Fredoka and Nunito, rounded and calm, in both the app and the video overlays.
+**Type:** Instrument Serif for headlines, quotes and on-video cards, Instrument Sans for everything you operate, Geist Mono for timecodes, on an ink and champagne palette.
 
 **No dependencies.** No frameworks, no build step, no npm packages. The app is plain ES modules; the tests use Node's built-in runner.
 
@@ -98,14 +106,17 @@ The plan is rebuilt from scratch whenever you flip a switch or change a setting,
 npm test
 ```
 
-21 tests on the command parser, motion analysis and planner, including:
+28 tests on the command parser, motion analysis and planner, including:
 
 - every direction in English, Hinglish and Devanagari Hindi;
 - ordinary narration ("this hides the sidebar", "the cut off date") is not mistaken for a direction;
 - "scratch that" cuts the fumbled sentence, or only the fumbled breath when said mid-sentence;
 - "hide that" ignores the mouse and the caret, starts the blur when the secret appeared, and ends it when the secret leaves the screen;
 - dead air is trimmed but silent typing is kept;
-- zoom aims at the right region, eases, and stays inside the frame;
+- zoom goes to the centre or the named region, "more" goes closer, "for 3 seconds" zooms back out;
+- "cut the last 5 seconds", "cut the last two sentences", "cut from here … cut till here", "stop recording";
+- "hide that for N seconds", "hide that … show it", "hide the screen";
+- spoken commands are silenced when the screen moves and cut when it's still; phrase times are refined from the mic;
 - switching a direction off restores the footage;
 - source↔output time mapping round-trips exactly; SRT and YouTube chapter output;
 - camera directions build a timeline with smooth transitions, and are ignored inside ordinary sentences ("we bought a big camera");
@@ -135,7 +146,7 @@ Screen recording needs `localhost` or HTTPS.
 | Try the sample, edit, export | ✓ | ✓ | ✓ (WebM/MP4 depending on version) | ✓ |
 | Record | ✓ | ✓ | ✓ | – (browsers can't capture the screen) |
 | Voice directions | ✓ | – | partial | – |
-| Floating slate | ✓ (116+) | – | – | – |
+| Floating camera bubble | ✓ (116+) | – | – | – |
 
 ## Project layout
 

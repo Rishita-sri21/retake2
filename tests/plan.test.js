@@ -161,15 +161,25 @@ test('dead air is shortened, but silent typing on screen is kept', () => {
   assert.ok(plan.stats.deadAir > 3);
 });
 
-test('zoom eases in, holds and ends at "zoom out"', () => {
-  const motion = motionLog(20, [{ t0: 3, t1: 5, x0: 40, x1: 60, y0: 2, y1: 10 }]);
-  const plan = buildPlan(take([P('zoom here', 5, 6), P('look at that', 7, 9), P('zoom out', 12, 13)], 20, motion), { trimDeadAir: false });
-  const z = plan.zooms[0];
-  assert.ok(z.x > 0.6 && z.y < 0.35, 'aimed at the top right');
-  assert.ok(Math.abs(z.src1 - 12) < 0.3);
-  assert.equal(cameraAt(plan, z.src0).scale, 1);
-  assert.equal(cameraAt(plan, (z.src0 + z.src1) / 2).scale, 2);
-  assert.ok(z.x <= 0.75 && z.y >= 0.25, 'camera kept inside the frame');
+test('zoom goes to the centre, or where you say, and glides back out', () => {
+  const plan = buildPlan(
+    take([P('zoom in', 5, 6), P('look at that', 7, 9), P('zoom in on the top right', 10, 11.5), P('zoom in more', 13, 14), P('zoom out', 16, 17)], 20),
+    { trimDeadAir: false },
+  );
+  const [, center, topRight, more, out] = plan.view;
+  assert.deepEqual([center.scale, center.x, center.y], [2, 0.5, 0.5]);
+  assert.equal(topRight.x, 0.75);
+  assert.equal(topRight.y, 0.25);
+  assert.equal(more.scale, 3);
+  assert.equal(out.scale, 1);
+});
+
+test('"zoom in for 3 seconds" zooms back out by itself', async () => {
+  const { cameraAt } = await import('../src/plan.js');
+  const plan = buildPlan(take([P('zoom in for 3 seconds', 2, 3.5)], 12), { trimDeadAir: false });
+  assert.equal(plan.view.length, 3);
+  assert.equal(cameraAt(plan, 5).scale, 2);
+  assert.equal(cameraAt(plan, 9).scale, 1);
 });
 
 test('switching a command off undoes its edit', () => {
@@ -246,4 +256,59 @@ test('demo mode keeps directions audible and plays would-be cuts fast', () => {
 test('camera directions inside a sentence are ignored', () => {
   const plan = buildPlan(take([P('we bought a big camera for the shoot', 1, 4)], 6), { trimDeadAir: false });
   assert.deepEqual(plan.camera.map((c) => c.mode), ['small']);
+});
+
+test('"cut the last 5 seconds" and "cut the last two sentences"', () => {
+  const t = take([P('first sentence here', 1, 3), P('second sentence here', 4, 6), P('third sentence here', 7, 9), P('cut the last two sentences', 10, 11.5), P('keep this one', 12, 14)], 16);
+  const plan = buildPlan(t, { trimDeadAir: false });
+  const c = plan.cuts.find((x) => x.reason === 'cut');
+  assert.ok(c.src0 > 3 && c.src0 < 4.2, `starts at the second sentence (${c.src0})`);
+  assert.ok(c.src1 >= 11.2 && c.src1 < 12);
+  const t2 = take([P('talking for a while now', 1, 9), P('cut the last 5 seconds', 10, 11.5)], 13);
+  const c2 = buildPlan(t2, { trimDeadAir: false }).cuts.find((x) => x.reason === 'cut');
+  assert.ok(Math.abs(c2.src0 - 5) < 0.3, `5s before the command (${c2.src0})`);
+});
+
+test('"cut from here" ... "cut till here" removes the stretch between', () => {
+  const t = take([P('good part', 1, 3), P('cut from here', 4, 5), P('messy part', 6, 12), P('cut till here', 13, 14), P('good again', 15, 17)], 18);
+  const c = buildPlan(t, { trimDeadAir: false }).cuts.find((x) => x.reason === 'cut');
+  assert.ok(c.src0 > 3.5 && c.src0 < 4.2);
+  assert.ok(c.src1 > 13.6 && c.src1 < 14.6);
+});
+
+test('"stop recording" ends the video there', () => {
+  const plan = buildPlan(take([P('that is all', 1, 3), P('stop recording', 4, 5)], 8), { trimDeadAir: false });
+  assert.ok(plan.finalDuration < 4.2 && plan.finalDuration > 3.5, `ends at ${plan.finalDuration}`);
+});
+
+test('hide for N seconds, until "show it", and the whole screen', () => {
+  const motion = motionLog(30, [{ t0: 5, t1: 5.4, x0: 4, x1: 30, y0: 6, y1: 7 }]);
+  const forTen = buildPlan(take([P('hide that for ten seconds', 6, 8)], 30, motion), { trimDeadAir: false }).blurs[0];
+  assert.ok(Math.abs(forTen.src1 - 17.5) < 0.6, `ends ${forTen.src1}`);
+  const until = buildPlan(take([P('hide that', 6, 7), P('show it', 20, 21)], 30, motion), { trimDeadAir: false }).blurs[0];
+  assert.ok(Math.abs(until.src1 - 20.6) < 0.6, `ends ${until.src1}`);
+  const screen = buildPlan(take([P('hide the screen', 3, 4), P('show the screen', 9, 10)], 30), { trimDeadAir: false }).blurs[0];
+  assert.equal(screen.full, true);
+  assert.deepEqual(screen.box, { x: 0, y: 0, w: 1, h: 1 });
+  assert.ok(screen.src1 > 8.5 && screen.src1 < 9.5);
+});
+
+test('smart final cut: commands are silenced while the screen moves, cut when it is still', () => {
+  const moving = motionLog(12, [{ t0: 0, t1: 12, x0: 10, x1: 20, y0: 10, y1: 20 }]);
+  const a = buildPlan(take([P('zoom in', 4, 5)], 12, moving), { trimDeadAir: false });
+  assert.equal(a.mutes.length, 1, 'muted, picture kept');
+  assert.equal(a.cuts.length, 0);
+  const b = buildPlan(take([P('zoom in', 4, 5)], 12), { trimDeadAir: false });
+  assert.equal(b.mutes.length, 0);
+  assert.equal(b.cuts.filter((c) => c.reason === 'command').length, 1, 'cut, nothing visible jumps');
+});
+
+test('phrase timing is re-measured from the voice', async () => {
+  const { refinePhrases } = await import('../src/plan.js');
+  // Voice from 2.0 to 4.0; recognition reported 2.6 to 5.5 (late on both ends).
+  const dt = 0.05, values = new Float32Array(200);
+  for (let t = 2; t < 4; t += dt) values[Math.floor(t / dt)] = 0.3;
+  const [p] = refinePhrases({ duration: 10, phrases: [P('hello there', 2.6, 5.5)], levels: { dt, values }, motion: [] }, 0.04);
+  assert.ok(Math.abs(p.start - 2) < 0.15, `start ${p.start}`);
+  assert.ok(Math.abs(p.end - 4.1) < 0.15, `end ${p.end}`);
 });
