@@ -27,19 +27,22 @@ const COLORS = {
   pause: 'var(--rec)', resume: 'var(--rec)', stop: 'var(--rec)',
 };
 
+/** Other ways to say each command, shown on the help cards. */
 const HINDI = {
-  cut: 'kaat do · काट दो', hide: 'chhupa do · छुपा दो', zoomIn: 'zoom karo · ज़ूम करो', zoomOut: 'zoom out karo',
-  highlight: 'yahan dekho · यहाँ देखो', speedUp: 'tez karo · तेज़ करो', normalSpeed: 'normal karo', chapter: 'अध्याय: …',
-  title: 'टाइटल: …', mark: '', camBig: 'camera bada karo', camSmall: 'camera chhota karo', camHide: 'camera band karo',
-  camShow: 'camera chalu karo', cutFrom: 'yahan se kaato', cutTo: 'yahan tak kaato', hideScreen: 'screen chhupa do',
-  showScreen: 'screen dikhao', pause: 'ruko · रुको', resume: 'chalu karo', stop: 'recording band karo',
-  cutSentences: '', cutSeconds: '', unhide: 'ab dikhao',
+  cut: 'kaat do · काट दो · corta eso · coupe ça', hide: 'chhupa do · छुपा दो · oculta eso · cache ça', zoomIn: 'zoom karo · acércate · zoome',
+  zoomOut: 'zoom hatao · aléjate · dézoome', highlight: 'idhar dekho · mira aquí · regarde ici', speedUp: 'tez karo · jaldi karo · acelera',
+  normalSpeed: 'normal karo · velocidad normal', chapter: 'अध्याय: … · capítulo: … · Kapitel: …', title: 'टाइटल: … · título: …',
+  mark: 'mark karo · marca esto', camBig: 'camera bada karo · cámara grande', camSmall: 'camera chhota karo · back to the screen',
+  camHide: 'camera band karo', camShow: 'camera chalu karo', cutFrom: 'yahan se kaato', cutTo: 'yahan tak kaato',
+  hideScreen: 'screen chhupa do · oculta la pantalla', showScreen: 'screen dikhao', pause: 'hold on · one sec · ruko · pausa',
+  resume: 'continue · chalu karo · reprends', stop: 'that’s a wrap · recording band karo',
+  cutSentences: 'last line kaat do · borra la última frase', cutSeconds: 'pichhle 5 second kaat do', unhide: 'ab dikhao',
 };
 
 const DOES = {
   cut: 'Cuts the sentence you just fumbled, and what happened on screen while you said it.',
   hide: 'Blurs whatever just appeared on screen, from the moment it appeared until it leaves.',
-  zoomIn: 'Glides into the part of the screen that just changed.',
+  zoomIn: 'Glides to the centre. Add “on the top right”, “more” or “for 3 seconds”.',
   zoomOut: 'Eases back to the full screen.',
   highlight: 'Dims the screen and rings what just changed.',
   speedUp: 'Fast-forwards the slow part until you say “normal speed”.',
@@ -157,7 +160,7 @@ function badge(type, cls) {
 function renderVocab() {
   /** @type {Record<string, typeof GRAMMAR>} */
   const by = {};
-  for (const g of GRAMMAR) (by[g.group] ||= []).push(g);
+  for (const g of GRAMMAR) if (!g.hidden) (by[g.group] ||= []).push(g);
   $('vocab').replaceChildren(
     ...Object.entries(by).map(([group, list]) => {
       const sec = document.createElement('section');

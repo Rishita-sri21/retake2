@@ -5,11 +5,21 @@
  * fast-forward, where the virtual camera points, what to blur, where
  * chapters start, and the captions.
  *
+ * The timing problem at the heart of it: browser speech recognition tells us
+ * *what* was said but only roughly *when* (phrases arrive ~0.5–1.5s late, with
+ * no word times). So every phrase is re-measured against the microphone:
+ *
+ *   1. a voice-activity mask (hysteresis on the loudness, short gaps between
+ *      words bridged) finds where speech really starts and stops;
+ *   2. each word is placed inside its phrase by spreading the phrase's
+ *      syllables over its voiced frames (a light forced alignment);
+ *   3. cuts, silenced commands and captions are all cut from those times.
+ *
  * Nothing here touches pixels; the renderer reads the plan. The plan is
  * rebuilt from scratch whenever a setting or a command toggle changes, so
  * every edit is non-destructive.
  */
-import { parseCommands, stripCommands } from './commands.js';
+import { parseCommands } from './commands.js';
 import { focusAt, secretAt, goneAt, activity } from './motion.js';
 
 /** @typedef {import('./commands.js').Phrase} Phrase */
@@ -17,12 +27,13 @@ import { focusAt, secretAt, goneAt, activity } from './motion.js';
 /** @typedef {import('./motion.js').MotionSample} MotionSample */
 /** @typedef {import('./motion.js').Box} Box */
 /** @typedef {'small'|'big'|'hidden'} CamMode */
+/** @typedef {{dt: number, values: ArrayLike<number>}} Levels */
 
 /**
  * @typedef {Object} Take
  * @property {number} duration
  * @property {Phrase[]} phrases
- * @property {{dt: number, values: ArrayLike<number>}} levels   Mic loudness (0..1) every dt seconds.
+ * @property {Levels} levels   Mic loudness (0..1) every dt seconds.
  * @property {MotionSample[]} motion
  * @property {CamMode} [cameraStart]  How the camera bubble starts (default 'small').
  * @property {number[]} [joins]       Where the recording was paused and resumed.
@@ -40,7 +51,8 @@ import { focusAt, secretAt, goneAt, activity } from './motion.js';
  * @property {string[]} disabled     Command ids the user switched off.
  * @property {'smart'|'cut'|'mute'} commandStyle  How spoken commands leave the final video.
  * @property {boolean} showDirections Demo mode: keep spoken commands in, label them, play would-be cuts fast.
- * @property {number} ghostRate       Speed of would-be-cut footage in demo mode.
+ * @property {number} ghostRate       Speed of would-be-cut silence in demo mode.
+ * @property {number} fumbleRate      Speed of would-be-cut speech in demo mode (kept audible).
  * @property {CamMode} [cameraStart]
  */
 
@@ -56,10 +68,18 @@ export const DEFAULTS = {
   commandStyle: 'smart',
   showDirections: false,
   ghostRate: 3,
+  fumbleRate: 1.25,
 };
 
+/** Playback faster than this is silent (fast-forward); slower keeps the voice. */
+export const AUDIBLE_RATE = 1.3;
+/** Output seconds a zoom takes to glide. */
+export const ZOOM_GLIDE = 1.1;
+/** Output seconds the camera bubble takes to change size. */
+export const CAM_GLIDE = 0.7;
+
 /**
- * @typedef {{src0: number, src1: number, rate: number, out0: number, out1: number, ghost?: 'fumble'|'dead-air'|'cut'}} Segment
+ * @typedef {{src0: number, src1: number, rate: number, out0: number, out1: number, ghost?: 'fumble'|'dead-air'|'cut', ramp?: boolean}} Segment
  * @typedef {{src0: number, src1: number, reason: 'fumble'|'command'|'dead-air'|'cut'|'stop', by?: string}} Cut
  * @typedef {{src0: number, src1: number, rate: number, by: string}} Speed
  * @typedef {{src: number, scale: number, x: number, y: number, by?: string}} View
@@ -67,7 +87,8 @@ export const DEFAULTS = {
  * @typedef {{src0: number, src1: number, box: Box, by: string, full?: boolean}} Blur
  * @typedef {{src0: number, src1: number, x: number, y: number, by: string}} Spot
  * @typedef {{src: number, out: number, title: string, by: string}} Chapter
- * @typedef {{out0: number, out1: number, text: string}} Caption
+ * @typedef {{out0: number, out1: number, text: string, words?: {text: string, out0: number}[]}} Caption
+ * @typedef {{text: string, start: number, end: number}} Word
  * @typedef {{
  *   duration: number, outDuration: number, finalDuration: number,
  *   segments: Segment[], cuts: Cut[], mutes: {src0: number, src1: number}[], speeds: Speed[],
@@ -75,29 +96,79 @@ export const DEFAULTS = {
  *   chapters: Chapter[], title: string | null, marks: {src: number, out: number, by: string}[],
  *   camera: {src: number, mode: CamMode, by?: string}[], camPath: {t: number, x: number, y: number}[],
  *   joins: number[], directions: {src0: number, src1: number, heard: string, did: string, type: string}[],
- *   showDirections: boolean, levels: {dt: number, values: ArrayLike<number>}, levelThreshold: number,
- *   phrases: Phrase[], captions: Caption[], commands: (Command & {effect: string})[],
+ *   showDirections: boolean, levels: Levels, levelThreshold: number,
+ *   phrases: Phrase[], words: Word[][], captions: Caption[], commands: (Command & {effect: string})[],
  *   stats: {removed: number, fumbles: number, deadAir: number, hidden: number, zooms: number, chapters: number, sped: number, muted: number}
  * }} Plan
  */
 
 const EPS = 1e-6;
 
-/**
- * @param {{dt: number, values: ArrayLike<number>}} levels
- * @param {number} t
- * @param {number} threshold
- */
-function loudAt(levels, t, threshold) {
-  const i = Math.floor(t / levels.dt);
-  return i >= 0 && i < levels.values.length && levels.values[i] >= threshold;
-}
+// ---------------------------------------------------------------- voice activity
+
+/** @type {WeakMap<object, Map<number, Uint8Array>>} */
+const maskCache = new WeakMap();
 
 /**
- * Speech recognition reports a phrase late: its first words ~0.5s after they
+ * Where the voice is, frame by frame. Hysteresis (a word starts above the
+ * threshold and continues down to half of it, so soft consonants at the edges
+ * count), then gaps shorter than 160ms are bridged (the breath between words)
+ * and blips shorter than 60ms dropped (a click, a tap on the desk).
+ * @param {Levels} levels @param {number} threshold
+ */
+export function voiceMask(levels, threshold) {
+  let byThr = maskCache.get(levels);
+  if (!byThr) maskCache.set(levels, (byThr = new Map()));
+  const hit = byThr.get(threshold);
+  if (hit) return hit;
+  const v = levels.values, n = v.length, dt = levels.dt;
+  const m = new Uint8Array(n);
+  const lo = threshold * 0.5;
+  // Forward and backward passes so the soft edges on both sides of a loud core count.
+  for (let i = 0, on = false; i < n; i++) {
+    on = v[i] >= threshold || (on && v[i] >= lo);
+    if (on) m[i] = 1;
+  }
+  for (let i = n - 1, on = false; i >= 0; i--) {
+    on = v[i] >= threshold || (on && v[i] >= lo);
+    if (on) m[i] = 1;
+  }
+  const bridge = Math.round(0.16 / dt), blip = Math.max(1, Math.round(0.06 / dt));
+  for (let i = 0; i < n; ) {
+    if (m[i]) {
+      i++;
+      continue;
+    }
+    let j = i;
+    while (j < n && !m[j]) j++;
+    if (i > 0 && j < n && j - i <= bridge) m.fill(1, i, j);
+    i = j;
+  }
+  for (let i = 0; i < n; ) {
+    if (!m[i]) {
+      i++;
+      continue;
+    }
+    let j = i;
+    while (j < n && m[j]) j++;
+    if (j - i < blip) m.fill(0, i, j);
+    i = j;
+  }
+  byThr.set(threshold, m);
+  return m;
+}
+
+/** @param {Uint8Array} mask @param {number} dt @param {number} t */
+const voiced = (mask, dt, t) => {
+  const i = Math.floor(t / dt);
+  return i >= 0 && i < mask.length && mask[i] === 1;
+};
+
+/**
+ * Speech recognition reports a phrase late: its first words ~0.5–1s after they
  * were spoken, its end up to a second or two after. Re-measure each phrase
  * from the microphone: start where the voice actually started, end where it
- * actually stopped. Captions and cuts both depend on this.
+ * actually stopped. Captions, cuts and silenced commands all depend on this.
  * @param {Take} take @param {number} threshold
  * @returns {Phrase[]}
  */
@@ -105,36 +176,114 @@ export function refinePhrases(take, threshold) {
   const lv = take.levels;
   if (!lv.values.length) return take.phrases.map((p) => ({ ...p }));
   const dt = lv.dt;
+  const mask = voiceMask(lv, threshold);
+  const at = (/** @type {number} */ t) => voiced(mask, dt, t);
   /** @type {Phrase[]} */
   const out = [];
   take.phrases.forEach((p, i) => {
-    const floor = i > 0 ? out[i - 1].end : 0;
+    const floor = i > 0 ? out[i - 1].end + 0.02 : 0;
     let start = Math.max(p.start, floor), end = p.end;
-    // End: walk back from the reported end to the last loud moment.
+    // End: walk back from the reported end to the last voiced moment.
     for (let t = p.end; t >= Math.max(start, p.end - 2.5); t -= dt) {
-      if (loudAt(lv, t, threshold)) {
-        end = t + 0.12;
+      if (at(t)) {
+        end = Math.floor(t / dt) * dt + dt + 0.06;
         break;
       }
     }
-    // Start: if we're in a silence, move forward to the voice...
-    if (!loudAt(lv, start, threshold)) {
-      for (let t = start; t < end; t += dt) {
-        if (loudAt(lv, t, threshold)) {
-          start = t;
-          break;
-        }
+    // Start: the reported start is often in the gap after the first word, or
+    // after the whole (short) phrase. Look back a little first, then forward.
+    if (!at(start)) {
+      let found = -1;
+      for (let t = start; t >= Math.max(floor, start - 0.7); t -= dt) if (at(t)) {
+        found = t;
+        break;
       }
+      if (found < 0) for (let t = start; t < end; t += dt) if (at(t)) {
+        found = t;
+        break;
+      }
+      if (found >= 0) start = found;
     }
-    // ...then walk back to where that voice began.
-    for (let t = start; t >= Math.max(floor, start - 1.2); t -= dt) {
-      if (!loudAt(lv, t, threshold)) break;
-      start = t;
+    // ...then walk back to where that stretch of voice began.
+    for (let t = start; t >= Math.max(floor, start - 2); t -= dt) {
+      if (!at(t)) break;
+      start = Math.floor(t / dt) * dt;
     }
-    start = Math.max(floor, start - 0.06);
+    start = Math.max(floor, start - 0.04);
     if (end <= start + 0.2) end = Math.max(p.end, start + 0.4);
     out.push({ text: p.text, start, end: Math.min(take.duration, end) });
   });
+  return out;
+}
+
+/** Rough syllable count, the unit speech time is spread over. @param {string} w */
+function syllables(w) {
+  const s = w.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
+  if (!s) return 0.2;
+  if (/^\d+$/.test(s)) return s.length * 1.4;
+  if (/[ऀ-ॿ]/u.test(s)) return Math.max(1, s.replace(/[ा-्ऀ-ः]/gu, '').length * 0.9);
+  const groups = s.match(/[aeiouyàáâãäåèéêëìíîïòóôõöùúûüæœ]+/gu);
+  const n = groups ? groups.length - (s.length > 3 && /[^aeiou]e$/.test(s) ? 1 : 0) : Math.ceil(s.length / 2);
+  return Math.max(1, n);
+}
+
+/**
+ * Place each word of a phrase in time: the phrase's syllables are spread over
+ * the frames where the voice was actually on, so pauses between words fall
+ * between words.
+ * @param {string} text @param {number} start @param {number} end
+ * @param {Levels} levels @param {number} threshold
+ * @returns {Word[]}
+ */
+export function alignWords(text, start, end, levels, threshold) {
+  const ws = text.normalize('NFC').replace(/\s+/g, ' ').trim().split(' ').filter(Boolean);
+  if (!ws.length) return [];
+  const weights = ws.map((w) => syllables(w) + 0.3);
+  const total = weights.reduce((a, b) => a + b, 0);
+  const dt = levels.dt;
+  /** @type {number[]} */
+  const frames = [];
+  if (levels.values.length) {
+    const mask = voiceMask(levels, threshold);
+    for (let i = Math.max(0, Math.floor(start / dt)); i * dt < end && i < mask.length; i++) if (mask[i]) frames.push(i * dt);
+  }
+  /** @type {Word[]} */
+  const out = [];
+  let acc = 0;
+  if (frames.length * dt < 0.3 * (end - start) || frames.length < ws.length) {
+    // Not enough voice measured: spread evenly by syllables.
+    for (let i = 0; i < ws.length; i++) {
+      const a = start + ((end - start) * acc) / total;
+      acc += weights[i];
+      out.push({ text: ws[i], start: a, end: start + ((end - start) * acc) / total });
+    }
+    return out;
+  }
+  const V = frames.length;
+  const timeAt = (/** @type {number} */ f) => frames[Math.min(V - 1, Math.max(0, Math.floor(f * V)))];
+  // Pauses inside the phrase (gaps of 120ms+ between voiced frames), as
+  // fractions of the voiced time. A word boundary near one snaps to it, since
+  // people pause between words, not inside them.
+  /** @type {number[]} */
+  const gaps = [];
+  for (let k = 1; k < V; k++) if (frames[k] - frames[k - 1] > 0.12) gaps.push(k / V);
+  /** @type {number[]} */
+  const bounds = [0];
+  for (let i = 0; i < ws.length - 1; i++) {
+    acc += weights[i];
+    let f = acc / total;
+    const reach = (0.6 * Math.min(weights[i], weights[i + 1])) / total;
+    let best = -1;
+    for (const g of gaps) if (Math.abs(g - f) <= reach && g > bounds[bounds.length - 1] && (best < 0 || Math.abs(g - f) < Math.abs(best - f))) best = g;
+    if (best >= 0) f = best;
+    bounds.push(Math.max(f, bounds[bounds.length - 1]));
+  }
+  bounds.push(1);
+  for (let i = 0; i < ws.length; i++) {
+    const a = timeAt(bounds[i]);
+    const b = timeAt(bounds[i + 1] - 1e-9) + dt;
+    out.push({ text: ws[i], start: a, end: Math.max(a + dt, b) });
+  }
   return out;
 }
 
@@ -147,6 +296,64 @@ function union(ranges) {
     const last = out[out.length - 1];
     if (last && r.src0 <= last.src1 + EPS) last.src1 = Math.max(last.src1, r.src1);
     else out.push({ src0: r.src0, src1: r.src1 });
+  }
+  return out;
+}
+
+/**
+ * Remove `holes` from `ranges`.
+ * @template {{src0: number, src1: number}} T
+ * @param {T[]} ranges @param {{src0: number, src1: number}[]} holes
+ * @returns {T[]}
+ */
+function subtract(ranges, holes) {
+  /** @type {T[]} */
+  let out = ranges.map((r) => ({ ...r }));
+  for (const h of holes) {
+    /** @type {T[]} */
+    const next = [];
+    for (const r of out) {
+      if (h.src1 <= r.src0 || h.src0 >= r.src1) next.push(r);
+      else {
+        if (h.src0 > r.src0) next.push({ ...r, src1: h.src0 });
+        if (h.src1 < r.src1) next.push({ ...r, src0: h.src1 });
+      }
+    }
+    out = next;
+  }
+  return out;
+}
+
+/**
+ * Speed ramps: rather than jumping from 1× to 4×, ease through intermediate
+ * rates over ~0.6s of output on each side. Every piece keeps a constant rate,
+ * so source↔output time stays exact.
+ * @template {{src0: number, src1: number, rate: number}} T
+ * @param {T[]} rated
+ * @returns {(T & {ramp?: boolean})[]}
+ */
+function withRamps(rated) {
+  /** @type {(T & {ramp?: boolean})[]} */
+  const out = [];
+  for (const r of rated) {
+    const steps = [0.22, 0.5, 0.78].map((f) => 1 + (r.rate - 1) * f);
+    const len = steps.reduce((n, s) => n + 0.2 * s, 0);
+    if (r.rate < 1.8 || r.src1 - r.src0 < len * 2 + 1) {
+      out.push(r);
+      continue;
+    }
+    let t = r.src0;
+    for (const s of steps) {
+      out.push({ ...r, src0: t, src1: t + 0.2 * s, rate: s, ramp: true });
+      t += 0.2 * s;
+    }
+    const tail = r.src1 - len;
+    out.push({ ...r, src0: t, src1: tail });
+    t = tail;
+    for (const s of [...steps].reverse()) {
+      out.push({ ...r, src0: t, src1: t + 0.2 * s, rate: s, ramp: true });
+      t += 0.2 * s;
+    }
   }
   return out;
 }
@@ -167,7 +374,17 @@ export function buildPlan(take, options = {}) {
   const clamp = (/** @type {number} */ t) => Math.max(0, Math.min(D, t));
   const disabled = new Set(o.disabled);
   const P = refinePhrases(take, o.levelThreshold);
-  const commands = parseCommands(P).map((c) => ({ ...c, enabled: !disabled.has(c.id), effect: '' }));
+  const W = P.map((p) => alignWords(p.text, p.start, p.end, take.levels, o.levelThreshold));
+  const joins = take.joins || [];
+  const commands = parseCommands(P).map((c) => {
+    const cmd = { ...c, enabled: !disabled.has(c.id), effect: '' };
+    // "pause"/"resume" only mean something where the recording really paused;
+    // anywhere else it was just a word in a sentence.
+    const p = P[c.phrase];
+    if (c.type === 'pause' && !joins.some((j) => j >= p.start - 0.5 && j <= p.end + 3)) (cmd.enabled = false), (cmd.effect = 'The recording didn’t pause here');
+    if (c.type === 'resume' && !joins.some((j) => j >= p.start - 4 && j <= p.start + 0.6)) (cmd.enabled = false), (cmd.effect = 'Nothing was paused here');
+    return cmd;
+  });
   const live = commands.filter((c) => c.enabled);
   const nextOf = (/** @type {Command} */ c, /** @type {string[]} */ types) =>
     live.find((d) => d.phrase > c.phrase && types.includes(d.type));
@@ -178,13 +395,20 @@ export function buildPlan(take, options = {}) {
     for (let k = i - 1; k >= 0; k--) if (!isCommandPhrase(k)) list.push(k);
     return list;
   };
+  /** When the command's own words start and end (aligned), not just the phrase. */
+  const cmdTimes = (/** @type {Command} */ c) => {
+    const w = W[c.phrase], p = P[c.phrase];
+    if (c.standalone || !w.length) return { start: p.start, end: p.end };
+    const a = w[Math.min(c.span[0], w.length - 1)], b = w[Math.min(c.span[1], w.length - 1)];
+    return { start: a.start, end: b.end };
+  };
 
   /** @type {Cut[]} */
   const cuts = [];
-  /** @type {{src0: number, src1: number, by: string, type: string}[]} Spoken command ranges: cut or silenced in the final video. */
+  /** @type {{src0: number, src1: number, by: string, type: string, edge: boolean}[]} Spoken command ranges: cut or silenced in the final video. */
   const spoken = [];
   /** @type {Speed[]} */
-  const speeds = [];
+  let speeds = [];
   /** @type {View[]} */
   const view = [{ src: 0, scale: 1, x: 0.5, y: 0.5 }];
   /** @type {Blur[]} */
@@ -200,40 +424,50 @@ export function buildPlan(take, options = {}) {
   const camera = [{ src: 0, mode: o.cameraStart || take.cameraStart || 'small' }];
 
   for (const c of live) {
-    if (c.standalone) spoken.push({ src0: clamp(P[c.phrase].start - 0.08), src1: clamp(P[c.phrase].end + 0.1), by: c.id, type: c.type });
+    const p = P[c.phrase], words = W[c.phrase];
+    if (c.standalone) {
+      // From just before the voice starts (fade out in time) to just after it stops.
+      spoken.push({ src0: clamp(p.start - 0.14), src1: clamp(p.end + 0.08), by: c.id, type: c.type, edge: true });
+    } else if (words.length && (c.span[0] === 0 || c.span[1] >= words.length - 1)) {
+      // A command at the start or end of a sentence ("...so zoom in"): silence just its words.
+      const t = cmdTimes(c);
+      const atStart = c.span[0] === 0;
+      spoken.push({ src0: clamp((atStart ? p.start : t.start) - 0.1), src1: clamp((atStart ? t.end : p.end) + 0.06), by: c.id, type: c.type, edge: !atStart });
+    }
   }
 
   for (const c of live) {
     const p = P[c.phrase];
-    const after = clamp(p.end + 0.1);
+    const t = cmdTimes(c);
+    const after = clamp(t.end + 0.1);
     switch (c.type) {
       case 'cut': {
         // The fumble is in this breath if you said enough before "scratch that",
         // otherwise it's the sentence before.
         const prev = narrationBefore(c.phrase)[0];
         const from = c.before >= 3 || prev === undefined ? p.start : P[prev].start;
-        cuts.push({ src0: clamp(from - 0.05), src1: after, reason: 'fumble', by: c.id });
-        c.effect = `Removed ${(after - from).toFixed(1)}s`;
+        cuts.push({ src0: clamp(from - 0.06), src1: clamp(p.end + 0.08), reason: 'fumble', by: c.id });
+        c.effect = `Removed ${(p.end - from).toFixed(1)}s`;
         break;
       }
       case 'cutSentences': {
         const list = narrationBefore(c.phrase);
         const n = Math.max(1, Math.min(list.length, Math.round(c.count || 1)));
         const from = list.length ? P[list[n - 1]].start : p.start;
-        cuts.push({ src0: clamp(from - 0.05), src1: after, reason: 'cut', by: c.id });
-        c.effect = `Removed ${n} sentence${n > 1 ? 's' : ''} (${(after - from).toFixed(1)}s)`;
+        cuts.push({ src0: clamp(from - 0.06), src1: clamp(p.end + 0.08), reason: 'cut', by: c.id });
+        c.effect = `Removed ${n} sentence${n > 1 ? 's' : ''} (${(p.end - from).toFixed(1)}s)`;
         break;
       }
       case 'cutSeconds': {
         const from = clamp(p.start - (c.seconds || 5));
-        cuts.push({ src0: from, src1: after, reason: 'cut', by: c.id });
-        c.effect = `Removed ${(after - from).toFixed(1)}s`;
+        cuts.push({ src0: from, src1: clamp(p.end + 0.08), reason: 'cut', by: c.id });
+        c.effect = `Removed ${(p.end - from).toFixed(1)}s`;
         break;
       }
       case 'cutFrom': {
         const to = nextOf(c, ['cutTo', 'stop']);
-        const end = to ? clamp(P[to.phrase].end + 0.1) : D;
-        cuts.push({ src0: clamp(p.start - 0.05), src1: end, reason: 'cut', by: c.id });
+        const end = to ? clamp(P[to.phrase].end + 0.08) : D;
+        cuts.push({ src0: clamp(p.start - 0.06), src1: end, reason: 'cut', by: c.id });
         c.effect = to ? `Removed ${(end - p.start).toFixed(1)}s, up to “${to.heard}”` : 'Removed everything after this (no “cut till here” was heard)';
         break;
       }
@@ -241,23 +475,24 @@ export function buildPlan(take, options = {}) {
         c.effect = live.some((d) => d.type === 'cutFrom' && d.phrase < c.phrase) ? 'End of the cut' : 'No “cut from here” before this';
         break;
       case 'stop':
-        cuts.push({ src0: clamp(p.start - 0.05), src1: D, reason: 'stop', by: c.id });
+        cuts.push({ src0: clamp(Math.min(p.start, t.start) - 0.08), src1: D, reason: 'stop', by: c.id });
         c.effect = 'The video ends here';
         break;
       case 'pause': {
         // Recording actually paused a moment after you said it: drop that moment too.
-        const j = (take.joins || []).find((x) => x >= p.start - 0.1);
-        if (j !== undefined) cuts.push({ src0: clamp(p.start - 0.05), src1: clamp(j), reason: 'command', by: c.id });
+        const j = joins.find((x) => x >= p.start - 0.5);
+        if (j !== undefined) cuts.push({ src0: clamp(Math.min(p.start, t.start) - 0.1), src1: clamp(Math.max(j, p.end)), reason: 'command', by: c.id });
         c.effect = 'Nothing was recorded until you resumed';
         break;
       }
       case 'resume':
+        cuts.push({ src0: clamp(p.start - 0.1), src1: clamp(p.end + 0.06), reason: 'command', by: c.id });
         c.effect = 'Recording picked up again';
         break;
       case 'speedUp': {
         const stop = nextOf(c, ['normalSpeed', 'speedUp']);
         const nextTalk = P.findIndex((q, i) => i > c.phrase && !isCommandPhrase(i));
-        const end = c.seconds ? after + c.seconds : stop ? P[stop.phrase].start : Math.min(nextTalk >= 0 ? P[nextTalk].start : D, after + 90);
+        const end = c.seconds ? after + c.seconds : stop ? cmdTimes(stop).start - 0.2 : Math.min(nextTalk >= 0 ? P[nextTalk].start - 0.25 : D, after + 90);
         const rate = c.rate || o.speed;
         if (end - after > 0.5) {
           speeds.push({ src0: after, src1: clamp(end), rate, by: c.id });
@@ -272,28 +507,30 @@ export function buildPlan(take, options = {}) {
         const half = 0.5 / scale;
         const x = Math.min(1 - half, Math.max(half, target[0]));
         const y = Math.min(1 - half, Math.max(half, target[1]));
-        view.push({ src: after, scale, x, y, by: c.id });
-        if (c.seconds) view.push({ src: clamp(after + c.seconds), scale: 1, x: 0.5, y: 0.5 });
+        // Start the glide as you say it, so it lands as you finish.
+        const at = clamp(t.start + 0.25);
+        view.push({ src: at, scale, x, y, by: c.id });
+        if (c.seconds) view.push({ src: clamp(at + c.seconds), scale: 1, x: 0.5, y: 0.5 });
         c.effect = `${String(Math.round(scale * 10) / 10)}× on the ${c.region ? c.region.replace('-', ' ') : c.more ? 'same spot' : 'centre'}${c.seconds ? ` for ${c.seconds}s` : ''}`;
         break;
       }
       case 'zoomOut':
-        view.push({ src: after, scale: 1, x: 0.5, y: 0.5, by: c.id });
+        view.push({ src: clamp(t.start + 0.25), scale: 1, x: 0.5, y: 0.5, by: c.id });
         c.effect = 'Back to the full screen';
         break;
       case 'highlight': {
         const f = focusAt(take.motion, p.end, 2.5);
-        spots.push({ src0: after, src1: clamp(after + (c.seconds || 2.8)), x: f ? f.x : 0.5, y: f ? f.y : 0.5, by: c.id });
+        spots.push({ src0: clamp(t.start + 0.2), src1: clamp(after + (c.seconds || 2.8)), x: f ? f.x : 0.5, y: f ? f.y : 0.5, by: c.id });
         c.effect = f ? 'Spotlight on what just changed' : 'Spotlight on the centre';
         break;
       }
       case 'hide': {
-        const secret = secretAt(take.motion, p.start + 0.4);
+        const secret = secretAt(take.motion, t.start + 0.4);
         if (secret) {
           const un = nextOf(c, ['unhide']);
-          const gone = goneAt(take.motion, secret.box, p.start + 0.4);
+          const gone = goneAt(take.motion, secret.box, t.start + 0.4);
           let end = D, why = 'to the end';
-          if (c.seconds) [end, why] = [p.end + c.seconds, `for ${c.seconds}s`];
+          if (c.seconds) [end, why] = [t.end + c.seconds, `for ${c.seconds}s`];
           else if (un) [end, why] = [P[un.phrase].end, `until you said “${un.heard}”`];
           else if (gone !== null) [end, why] = [gone + 0.1, 'until it left the screen'];
           blurs.push({ src0: secret.start, src1: clamp(end), box: secret.box, by: c.id });
@@ -306,8 +543,8 @@ export function buildPlan(take, options = {}) {
         break;
       case 'hideScreen': {
         const show = nextOf(c, ['showScreen']);
-        const end = c.seconds ? p.end + c.seconds : show ? P[show.phrase].start : D;
-        blurs.push({ src0: p.start, src1: clamp(end), box: { x: 0, y: 0, w: 1, h: 1 }, full: true, by: c.id });
+        const end = c.seconds ? t.end + c.seconds : show ? P[show.phrase].start : D;
+        blurs.push({ src0: clamp(t.start - 0.1), src1: clamp(end), box: { x: 0, y: 0, w: 1, h: 1 }, full: true, by: c.id });
         c.effect = c.seconds ? `Whole screen hidden for ${c.seconds}s` : show ? `Whole screen hidden until “${show.heard}”` : 'Whole screen hidden to the end';
         break;
       }
@@ -335,7 +572,7 @@ export function buildPlan(take, options = {}) {
       case 'camHide': {
         const mode = c.type === 'camBig' ? 'big' : c.type === 'camHide' ? 'hidden' : 'small';
         // Start the move while you're still saying it, so it's part of the shot.
-        camera.push({ src: clamp(p.start + 0.15), mode, by: c.id });
+        camera.push({ src: clamp(t.start + 0.15), mode, by: c.id });
         c.effect = mode === 'big' ? 'Your face fills the frame' : mode === 'hidden' ? 'Camera bubble hidden' : 'Camera bubble back in place';
         break;
       }
@@ -343,40 +580,49 @@ export function buildPlan(take, options = {}) {
   }
   view.sort((a, b) => a.src - b.src);
 
+  // Narration is never fast-forwarded: if you talk during a speed-up, it
+  // drops back to normal speed for what you say, then picks up again.
+  /** @type {{src0: number, src1: number}[]} */
+  const talk = [];
+  P.forEach((p, i) => {
+    if (!isCommandPhrase(i)) talk.push({ src0: p.start - 0.3, src1: p.end + 0.3 });
+  });
+  speeds = subtract(speeds, talk).filter((s) => s.src1 - s.src0 > 1);
+
   // Spoken commands. "Smart" silences them while the screen is moving (no jump
   // in the picture) and cuts them where the screen is still (no visible jump).
   /** @type {{src0: number, src1: number}[]} */
   const mutes = [];
   for (const s of spoken) {
-    if (['cut', 'cutSentences', 'cutSeconds', 'stop', 'pause'].includes(s.type)) continue; // already inside a cut
+    if (['cut', 'cutSentences', 'cutSeconds', 'stop', 'pause', 'resume', 'cutFrom'].includes(s.type)) continue; // already inside a cut
     const still = activity(take.motion, s.src0, s.src1) < 0.004;
-    const style = o.commandStyle === 'smart' ? (still ? 'cut' : 'mute') : o.commandStyle;
+    const style = o.commandStyle === 'smart' ? (still && s.edge !== false ? 'cut' : 'mute') : o.commandStyle;
     if (style === 'cut') cuts.push({ src0: s.src0, src1: s.src1, reason: 'command', by: s.by });
     else mutes.push({ src0: s.src0, src1: s.src1 });
   }
 
-  // Dead air: long silences where nothing happens on screen.
+  // Dead air: long silences where nothing happens on screen. Anything speech
+  // recognition heard is protected, even if the mic level was low.
   let deadAir = 0;
   if (o.trimDeadAir && take.levels.values.length) {
     const { dt, values } = take.levels;
+    const mask = voiceMask(take.levels, o.levelThreshold);
+    const heard = [...take.phrases, ...P].map((p) => ({ src0: p.start - 0.15, src1: p.end + 0.15 }));
     let runStart = -1;
-    const flush = (/** @type {number} */ endIdx) => {
-      const s0 = runStart * dt, s1 = endIdx * dt;
-      if (s1 - s0 >= o.deadAirMin && activity(take.motion, s0, s1) < 0.004) {
-        const inSpeed = speeds.some((r) => s0 < r.src1 && s1 > r.src0);
-        if (!inSpeed) {
-          const a = s0 + o.deadAirKeep / 2, b = s1 - o.deadAirKeep / 2;
+    for (let i = 0; i <= values.length; i++) {
+      const silent = i < values.length && !mask[i];
+      if (silent && runStart < 0) runStart = i;
+      if (!silent && runStart >= 0) {
+        const s0 = runStart * dt, s1 = Math.min(i * dt, D);
+        runStart = -1;
+        for (const r of subtract([{ src0: s0, src1: s1 }], heard)) {
+          if (r.src1 - r.src0 < o.deadAirMin || activity(take.motion, r.src0, r.src1) >= 0.004) continue;
+          if (speeds.some((sp) => r.src0 < sp.src1 && r.src1 > sp.src0)) continue;
+          // Keep a natural beat: a little more after you stop than before you start.
+          const a = r.src0 + o.deadAirKeep * 0.55, b = r.src1 - o.deadAirKeep * 0.45;
           cuts.push({ src0: a, src1: b, reason: 'dead-air' });
           deadAir += b - a;
         }
-      }
-    };
-    for (let i = 0; i <= values.length; i++) {
-      const silent = i < values.length && values[i] < o.levelThreshold;
-      if (silent && runStart < 0) runStart = i;
-      if (!silent && runStart >= 0) {
-        flush(Math.min(i, Math.round(D / dt)));
-        runStart = -1;
       }
     }
   }
@@ -393,7 +639,7 @@ export function buildPlan(take, options = {}) {
 
   /**
    * @param {{src0: number, src1: number}[]} ranges
-   * @param {{src0: number, src1: number, rate: number, ghost?: Segment['ghost']}[]} rated
+   * @param {{src0: number, src1: number, rate: number, ghost?: Segment['ghost'], ramp?: boolean}[]} rated
    */
   const segmentsOf = (ranges, rated) => {
     /** @type {Segment[]} */
@@ -412,6 +658,7 @@ export function buildPlan(take, options = {}) {
         /** @type {Segment} */
         const seg = { src0: a, src1: b, rate, out0: out, out1: out + (b - a) / rate };
         if (sp?.ghost) seg.ghost = sp.ghost;
+        if (sp?.ramp) seg.ramp = true;
         segs.push(seg);
         out += (b - a) / rate;
       }
@@ -419,25 +666,34 @@ export function buildPlan(take, options = {}) {
     return { segs, out };
   };
 
-  const finalCut = segmentsOf(keep, speeds);
+  const finalCut = segmentsOf(keep, withRamps(speeds));
   let segments = finalCut.segs;
   let outDuration = finalCut.out;
   let finalMutes = mutes;
 
   if (o.showDirections) {
     // Demo mode: nothing is removed. Spoken commands stay audible; what the
-    // final cut removes plays fast under a red overlay instead.
+    // final cut removes plays under a red overlay instead: silences fast,
+    // fumbled speech just a little faster and still audible, so viewers hear
+    // the mistake and the command that removed it.
     /** @type {{src0: number, src1: number, rate: number, ghost: NonNullable<Segment['ghost']>}[]} */
     const ghosts = [];
     for (const c of cuts) {
       if (c.reason === 'command') continue;
-      // Keep the spoken command that asked for the cut audible at normal speed.
+      // Keep the spoken command that asked for the cut at normal speed.
       const cmdSpoken = spoken.find((s) => s.by === c.by);
       const end = cmdSpoken && cmdSpoken.src0 > c.src0 ? cmdSpoken.src0 : c.src1;
-      if (end - c.src0 > 0.1) ghosts.push({ src0: c.src0, src1: end, rate: o.ghostRate, ghost: c.reason === 'dead-air' ? 'dead-air' : c.reason === 'fumble' ? 'fumble' : 'cut' });
+      const kind = c.reason === 'dead-air' ? 'dead-air' : c.reason === 'fumble' ? 'fumble' : 'cut';
+      if (end - c.src0 > 0.1) ghosts.push({ src0: c.src0, src1: end, rate: kind === 'dead-air' ? o.ghostRate : o.fumbleRate, ghost: kind });
     }
-    const merged = union(ghosts).map((g) => ({ ...g, rate: o.ghostRate, ghost: ghosts.find((x) => x.src0 < g.src1 && x.src1 > g.src0)?.ghost }));
-    const demo = segmentsOf([{ src0: 0, src1: D }], [...speeds.filter((sp) => !merged.some((g) => sp.src0 < g.src1 && sp.src1 > g.src0)), ...merged]);
+    // Overlapping ghosts: the speech-bearing kind wins, so no voice is skipped.
+    ghosts.sort((a, b) => a.rate - b.rate);
+    /** @type {typeof ghosts} */
+    let merged = [];
+    for (const g of ghosts) merged = [...merged, ...subtract([g], merged)];
+    merged.sort((a, b) => a.src0 - b.src0);
+    const sp = subtract(speeds, merged);
+    const demo = segmentsOf([{ src0: 0, src1: D }], [...withRamps(sp), ...merged]);
     segments = demo.segs;
     outDuration = demo.out;
     finalMutes = [];
@@ -445,35 +701,71 @@ export function buildPlan(take, options = {}) {
 
   /** @param {number} t */
   const toOut = (t) => srcToOut(segments, t, outDuration);
+  /** @param {number} t */
+  const playing = (t) => {
+    const s = segments.find((g) => t >= g.src0 && t < g.src1);
+    return Boolean(s && s.rate <= AUDIBLE_RATE) && !finalMutes.some((m) => t >= m.src0 && t < m.src1);
+  };
 
-  // Captions from the narration that survived, timed from the measured phrases.
+  // Captions, word by word: the narration that survived, timed from the
+  // aligned words, broken at pauses and punctuation into short lines.
   /** @type {Caption[]} */
   const captions = [];
   P.forEach((p, i) => {
     if (isCommandPhrase(i)) return;
-    const text = stripCommands(p.text);
-    if (!text) return;
-    const w = text.split(/\s+/);
-    const per = Math.max(3, Math.ceil(w.length / Math.ceil(w.length / 7)));
-    const chunks = [];
-    for (let k = 0; k < w.length; k += per) chunks.push(w.slice(k, k + per).join(' '));
-    const total = chunks.reduce((n, ch) => n + ch.length + 1, 0);
-    let t = p.start;
-    for (const ch of chunks) {
-      const len = ((p.end - p.start) * (ch.length + 1)) / total;
-      const a = t, b = t + len;
-      t = b;
-      const mid = (a + b) / 2;
-      if (!segments.some((s) => mid >= s.src0 && mid < s.src1)) continue; // this bit was cut
-      if (finalMutes.some((m) => mid >= m.src0 && mid < m.src1)) continue;
-      const out0 = toOut(a), out1 = toOut(b);
-      if (out1 - out0 > 0.15) captions.push({ out0, out1, text: ch });
-    }
+    const words = W[i];
+    const drop = new Set();
+    for (const c of commands) if (c.phrase === i && c.type !== 'chapter' && c.type !== 'title') for (let k = c.span[0]; k <= c.span[1]; k++) drop.add(k);
+    if (live.some((c) => c.phrase === i && (c.type === 'chapter' || c.type === 'title'))) return;
+    /** @param {Word[]} line */
+    const emit = (line) => {
+      const out0 = toOut(line[0].start), out1 = toOut(line[line.length - 1].end);
+      if (out1 - out0 > 0.12) captions.push({ out0, out1, text: line.map((w) => w.text).join(' '), words: line.map((w) => ({ text: w.text, out0: toOut(w.start) })) });
+    };
+    // A run is speech without a break (a pause, a full stop, a cut). Each run
+    // is split into balanced lines, so a long sentence never leaves one word
+    // stranded on a line of its own.
+    /** @param {Word[]} run */
+    const flushRun = (run) => {
+      if (!run.length) return;
+      const len = (/** @type {Word[]} */ ws) => ws.reduce((n, x) => n + x.text.length + 1, 0) - 1;
+      const n = Math.max(Math.ceil(len(run) / 38), Math.ceil(run.length / 8));
+      const target = len(run) / n;
+      let line = /** @type {Word[]} */ ([]);
+      for (let k = 0; k < run.length; k++) {
+        line.push(run[k]);
+        const left = run.length - k - 1;
+        const here = len(line);
+        const comma = /[,;:]$/.test(run[k].text) && here >= target * 0.6;
+        if (left >= 2 && (here >= target - 2 || comma)) {
+          emit(line);
+          line = [];
+        }
+      }
+      if (line.length) emit(line);
+    };
+    /** @type {Word[]} */
+    let run = [];
+    const cut = () => {
+      flushRun(run);
+      run = [];
+    };
+    words.forEach((w, k) => {
+      const mid = (w.start + w.end) / 2;
+      if (drop.has(k) || !playing(mid)) return cut();
+      const prev = run[run.length - 1];
+      if (prev && w.start - prev.end > 0.55) cut();
+      run.push(w);
+      if (/[.!?।]$/.test(w.text)) cut();
+    });
+    cut();
   });
-  // Hold each caption a little, until the next one, so they don't flicker.
+  captions.sort((a, b) => a.out0 - b.out0);
+  // Hold each line a moment after the voice stops, never into the next one.
   for (let i = 0; i < captions.length; i++) {
     const next = captions[i + 1];
-    captions[i].out1 = Math.min(next ? next.out0 : outDuration, captions[i].out1 + 0.6);
+    const limit = next ? next.out0 - 0.04 : outDuration;
+    captions[i].out1 = Math.max(captions[i].out1, Math.min(limit, Math.max(captions[i].out1 + 0.45, captions[i].out0 + 1.1)));
   }
 
   const chapters = chapterSrc.map((c) => ({ ...c, out: toOut(c.src) }));
@@ -486,8 +778,8 @@ export function buildPlan(take, options = {}) {
 
   const directions = o.showDirections
     ? live.map((c) => {
-        const p = P[c.phrase];
-        return { src0: p.start, src1: Math.min(D, p.end + 1.8), heard: c.heard, did: c.effect, type: c.type };
+        const t = cmdTimes(c);
+        return { src0: t.start, src1: Math.min(D, t.end + 1.8), heard: c.heard, did: c.effect, type: c.type };
       })
     : [];
 
@@ -512,12 +804,13 @@ export function buildPlan(take, options = {}) {
     marks: markSrc.map((m) => ({ ...m, out: toOut(m.src) })),
     camera: camera.sort((a, b) => a.src - b.src),
     camPath: take.camPath || [],
-    joins: take.joins || [],
+    joins,
     directions,
     showDirections: o.showDirections,
     levels: take.levels,
     levelThreshold: o.levelThreshold,
     phrases: P,
+    words: W,
     captions,
     commands,
     stats: {
@@ -538,11 +831,15 @@ export function buildPlan(take, options = {}) {
  * @param {Segment[]} segments @param {number} t @param {number} outDuration
  */
 export function srcToOut(segments, t, outDuration) {
-  for (const s of segments) {
-    if (t < s.src0) return s.out0;
-    if (t < s.src1) return s.out0 + (t - s.src0) / s.rate;
+  // Binary search: this runs several times per frame.
+  let lo = 0, hi = segments.length - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1, s = segments[mid];
+    if (t < s.src0) hi = mid - 1;
+    else if (t >= s.src1) lo = mid + 1;
+    else return s.out0 + (t - s.src0) / s.rate;
   }
-  return outDuration;
+  return lo < segments.length ? segments[lo].out0 : outDuration;
 }
 
 /**
@@ -569,26 +866,41 @@ export function segmentAt(segments, t) {
   return null;
 }
 
+/** Smooth in and out, with zero acceleration at both ends. @param {number} k */
+const smoother = (k) => k * k * k * (k * (k * 6 - 15) + 10);
 /** @param {number} k */
 const ease = (k) => (k < 0.5 ? 4 * k * k * k : 1 - Math.pow(-2 * k + 2, 3) / 2);
 
 /**
- * Virtual camera at a source time: glides from one view to the next.
+ * Virtual camera at a source time. Glides are timed in *output* time, so a
+ * zoom looks the same whether the footage around it is cut, sped up or not.
+ * Scale is interpolated logarithmically (equal steps feel equally fast, as
+ * with a real lens), and a new glide starts from wherever the last one had
+ * got to, so quick "zoom in … zoom out" never jumps.
  * @param {Plan} plan @param {number} t
  * @returns {{scale: number, x: number, y: number}}
  */
 export function cameraAt(plan, t) {
   const v = plan.view || [{ src: 0, scale: 1, x: 0.5, y: 0.5 }];
-  let i = 0;
-  while (i + 1 < v.length && v[i + 1].src <= t) i++;
-  const cur = v[i], prev = v[i - 1];
-  if (!prev) return { scale: cur.scale, x: cur.x, y: cur.y };
-  const e = ease(Math.min(1, Math.max(0, (t - cur.src) / 0.8)));
-  return { scale: prev.scale + (cur.scale - prev.scale) * e, x: prev.x + (cur.x - prev.x) * e, y: prev.y + (cur.y - prev.y) * e };
+  const segs = plan.segments || [];
+  const outOf = (/** @type {number} */ s) => (segs.length ? srcToOut(segs, s, plan.outDuration) : s);
+  const now = outOf(t);
+  let state = { scale: v[0].scale, x: v[0].x, y: v[0].y };
+  for (let i = 1; i < v.length; i++) {
+    const k0 = outOf(v[i].src);
+    if (k0 > now + EPS || v[i].src > t + EPS) break;
+    const next = v[i + 1];
+    // Where the glide is when the next one interrupts it (or now).
+    const until = next && next.src <= t ? Math.min(now, outOf(next.src)) : now;
+    const e = smoother(Math.min(1, Math.max(0, (until - k0) / ZOOM_GLIDE)));
+    const ls = Math.log(state.scale) + (Math.log(v[i].scale) - Math.log(state.scale)) * e;
+    state = { scale: Math.exp(ls), x: state.x + (v[i].x - state.x) * e, y: state.y + (v[i].y - state.y) * e };
+  }
+  return state;
 }
 
 /**
- * Camera bubble state at a source time, with a 0.6s transition between modes.
+ * Camera bubble state at a source time, with a short glide between modes.
  * @param {Plan} plan @param {number} t
  * @returns {{from: CamMode, to: CamMode, k: number}}
  */
@@ -597,8 +909,10 @@ export function cameraModeAt(plan, t) {
   let i = 0;
   while (i + 1 < list.length && list[i + 1].src <= t) i++;
   const cur = list[i], prev = list[i - 1];
-  const k = prev ? Math.min(1, (t - cur.src) / 0.6) : 1;
-  return { from: prev ? prev.mode : cur.mode, to: cur.mode, k: ease(Math.max(0, k)) };
+  if (!prev) return { from: cur.mode, to: cur.mode, k: 1 };
+  const segs = plan.segments || [];
+  const d = segs.length ? srcToOut(segs, t, plan.outDuration) - srcToOut(segs, cur.src, plan.outDuration) : t - cur.src;
+  return { from: prev.mode, to: cur.mode, k: ease(Math.max(0, Math.min(1, d / CAM_GLIDE))) };
 }
 
 /** Where the floating bubble was at time t (centre, 0..1), or null. @param {Plan} plan @param {number} t */
@@ -616,6 +930,23 @@ export function camPathAt(plan, t) {
 /** Is the sound silenced at this source time (a spoken command)? @param {Plan} plan @param {number} t */
 export function mutedAt(plan, t) {
   return plan.mutes.some((m) => t >= m.src0 && t < m.src1);
+}
+
+/**
+ * The volume the final video should have at a source time: silent during a
+ * silenced command or a fast-forward, and faded out just before a cut so the
+ * jump never chops a sound.
+ * @param {Plan} plan @param {number} t @param {number} [lookahead]
+ */
+export function gainAt(plan, t, lookahead = 0.07) {
+  const seg = segmentAt(plan.segments, t);
+  if (!seg || seg.rate > AUDIBLE_RATE) return 0;
+  if (mutedAt(plan, t) || mutedAt(plan, t + lookahead)) return 0;
+  const next = plan.segments[plan.segments.indexOf(seg) + 1];
+  const jump = next && next.src0 > seg.src1 + 0.04;
+  if ((jump || !next) && t > seg.src1 - lookahead) return 0;
+  if (next && next.rate > AUDIBLE_RATE && t > seg.src1 - lookahead) return 0;
+  return 1;
 }
 
 /** Mic loudness at a source time (0..1). @param {Plan} plan @param {number} t */
@@ -646,9 +977,12 @@ export function toSrt(captions) {
   return captions.map((c, i) => `${i + 1}\n${srtTime(c.out0)} --> ${srtTime(c.out1)}\n${c.text}\n`).join('\n');
 }
 
-/** @param {Caption[]} captions */
+/** WebVTT with word timestamps, so players that support it can highlight word by word. @param {Caption[]} captions */
 export function toVtt(captions) {
-  return `WEBVTT\n\n${captions.map((c) => `${srtTime(c.out0).replace(',', '.')} --> ${srtTime(c.out1).replace(',', '.')}\n${c.text}\n`).join('\n')}`;
+  const ts = (/** @type {number} */ s) => srtTime(s).replace(',', '.');
+  const body = (/** @type {Caption} */ c) =>
+    c.words && c.words.length > 1 ? c.words.map((w, i) => (i ? `<${ts(Math.max(c.out0, w.out0))}>` : '') + w.text).join(' ') : c.text;
+  return `WEBVTT\n\n${captions.map((c) => `${ts(c.out0)} --> ${ts(c.out1)}\n${body(c)}\n`).join('\n')}`;
 }
 
 /**
