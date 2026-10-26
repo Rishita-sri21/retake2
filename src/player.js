@@ -4,7 +4,7 @@
  * at speed, and draws every frame with the renderer. The export is the same
  * loop running onto a recorded canvas.
  */
-import { segmentAt, srcToOut, outToSrc, mutedAt } from './plan.js';
+import { segmentAt, srcToOut, outToSrc, gainAt } from './plan.js';
 import { drawFrame } from './render.js';
 import { drawSample, drawPresenter, SAMPLE_W, SAMPLE_H, SAMPLE_DURATION } from './sample.js';
 
@@ -24,6 +24,10 @@ import { drawSample, drawPresenter, SAMPLE_W, SAMPLE_H, SAMPLE_DURATION } from '
  * @property {(rate: number) => void} setRate
  * @property {() => void} [tick]
  * @property {HTMLVideoElement} [video]
+ * @property {() => HTMLVideoElement[]} [elements]
+ * @property {(t: number) => void} [prime]      Get the standby decoder ready at t.
+ * @property {(t: number) => boolean} [canSwap] Is the standby decoder ready at t?
+ * @property {(rate: number) => void} [swap]    Cut to the standby decoder instantly.
  * @property {CameraFeed | null} [camera]
  */
 
@@ -62,28 +66,50 @@ export class CameraTrack {
   }
 }
 
-/** A recorded video file. */
+/**
+ * A recorded video file, played through two decoders. While one plays, the
+ * other waits, already seeked to where the next cut lands, so a cut is an
+ * instant switch rather than a seek (which stalls for 100–500ms on WebM).
+ */
 export class VideoSource {
   /** @param {Blob} blob @param {number} knownDuration */
   constructor(blob, knownDuration) {
-    const v = document.createElement('video');
-    v.playsInline = true;
-    v.preload = 'auto';
-    v.src = URL.createObjectURL(blob);
-    /** @type {any} */ (v).preservesPitch = true;
-    this.video = v;
-    this.frame = v;
+    this.url = URL.createObjectURL(blob);
+    this.video = this.make();
+    /** @type {HTMLVideoElement} */
+    this.alt = this.make();
+    this.frame = this.video;
     this.duration = knownDuration;
     this.width = 1280;
     this.height = 720;
+    this.primedAt = -1;
+    this.primed = false;
+    /** @type {((now: HTMLVideoElement, old: HTMLVideoElement) => void) | undefined} */
+    this.onSwap = undefined;
+  }
+
+  make() {
+    const v = document.createElement('video');
+    v.playsInline = true;
+    v.preload = 'auto';
+    v.src = this.url;
+    /** @type {any} */ (v).preservesPitch = true;
+    return v;
+  }
+
+  elements() {
+    return [this.video, this.alt];
   }
 
   async ready() {
     const v = this.video;
-    await new Promise((res, rej) => {
-      v.onloadedmetadata = () => res(undefined);
-      v.onerror = () => rej(new Error('This recording could not be opened.'));
-    });
+    const meta = (/** @type {HTMLVideoElement} */ el) =>
+      new Promise((res, rej) => {
+        if (el.readyState >= 1) return res(undefined);
+        el.addEventListener('loadedmetadata', () => res(undefined), { once: true });
+        el.addEventListener('error', () => rej(new Error('This recording could not be opened.')), { once: true });
+      });
+    await meta(v);
     this.width = v.videoWidth || 1280;
     this.height = v.videoHeight || 720;
     // MediaRecorder WebM files have no duration until the end has been read.
@@ -100,6 +126,7 @@ export class VideoSource {
     }
     if (Number.isFinite(v.duration) && v.duration > 0) this.duration = Math.min(this.duration || Infinity, v.duration);
     await this.seek(0);
+    meta(this.alt).catch(() => {});
   }
 
   time() {
@@ -112,14 +139,17 @@ export class VideoSource {
   }
   pause() {
     this.video.pause();
+    this.alt.pause();
   }
   /** @param {number} rate */
   setRate(rate) {
-    this.video.playbackRate = rate;
+    if (this.video.playbackRate !== rate) this.video.playbackRate = rate;
   }
   /** @param {number} t */
   seek(t) {
     const v = this.video;
+    this.primed = false;
+    this.primedAt = -1;
     return new Promise((res) => {
       if (Math.abs(v.currentTime - t) < 0.01) return res(undefined);
       const done = () => {
@@ -130,6 +160,38 @@ export class VideoSource {
       v.currentTime = t;
       setTimeout(done, 1500);
     });
+  }
+  /** @param {number} t */
+  prime(t) {
+    if (Math.abs(this.primedAt - t) < 0.02) return;
+    const a = this.alt;
+    this.primedAt = t;
+    this.primed = false;
+    if (a.readyState < 1) return;
+    a.pause();
+    const done = () => {
+      a.removeEventListener('seeked', done);
+      if (Math.abs(this.primedAt - t) < 0.02) this.primed = true;
+    };
+    a.addEventListener('seeked', done);
+    a.currentTime = t;
+  }
+  /** @param {number} t */
+  canSwap(t) {
+    return this.primed && Math.abs(this.primedAt - t) < 0.05 && !this.alt.seeking && this.alt.readyState >= 2;
+  }
+  /** @param {number} rate */
+  swap(rate) {
+    const old = this.video;
+    this.video = this.alt;
+    this.alt = old;
+    this.frame = this.video;
+    this.primed = false;
+    this.primedAt = -1;
+    this.video.playbackRate = rate;
+    this.video.play().catch(() => {});
+    old.pause();
+    this.onSwap?.(this.video, old);
   }
 }
 
@@ -203,6 +265,12 @@ export class SampleSource {
 
 /**
  * Drives a source through a plan and paints a canvas.
+ *
+ * Cuts: the standby decoder is primed a second ahead, the sound is faded out
+ * just before the cut point, the picture switches decoders instantly and
+ * dissolves from the last frame, and the sound fades back in.
+ * Fast-forward: frames are blended into a short motion trail so 4× and 8×
+ * look smooth rather than strobing.
  */
 export class Player {
   /**
@@ -221,26 +289,50 @@ export class Player {
     this.playing = false;
     this.busy = false; // seeking across a cut
     this.rate = 1;
+    /** A smoothed copy of the source clock, for drawing glides without jitter. */
+    this.clock = 0;
+    this.clockAt = 0;
     /** @type {(out: number) => void} */
     this.onTime = () => {};
     /** @type {() => void} */
     this.onEnd = () => {};
-    /** @type {GainNode | null} */
+    /** @type {((jumping: boolean) => void) | undefined} */
+    this.onJump = undefined;
+    /** @type {GainNode | null} master volume */
     this.gain = null;
+    /** @type {Map<HTMLVideoElement, GainNode>} one per decoder */
+    this.elemGains = new Map();
+    this.lastGain = -1;
+    this.fadeStart = 0;
+    /** @type {number | undefined} */
+    this.lastSrc = undefined;
     this.raf = 0;
     this.loop = this.loop.bind(this);
     this.raf = requestAnimationFrame(this.loop);
+    const vs = /** @type {any} */ (source);
+    if ('onSwap' in vs) {
+      vs.onSwap = (/** @type {HTMLVideoElement} */ now, /** @type {HTMLVideoElement} */ old) => {
+        const t = this.actx?.currentTime ?? 0;
+        this.elemGains.get(old)?.gain.setTargetAtTime(0, t, 0.01);
+        this.elemGains.get(now)?.gain.setTargetAtTime(1, t, 0.01);
+      };
+    }
   }
 
-  /** Route the video's sound through Web Audio (needed for export and fast-forward muting). */
+  /** Route the video's sound through Web Audio (needed for export, fades and fast-forward muting). */
   audio() {
-    const v = this.source.video;
-    if (!v || this.gain) return this.gain;
+    const els = this.source.elements?.() ?? (this.source.video ? [this.source.video] : []);
+    if (!els.length || this.gain) return this.gain;
     const AC = window.AudioContext || /** @type {any} */ (window).webkitAudioContext;
     this.actx = new AC();
-    const node = this.actx.createMediaElementSource(v);
     this.gain = this.actx.createGain();
-    node.connect(this.gain);
+    for (const el of els) {
+      const node = this.actx.createMediaElementSource(el);
+      const g = this.actx.createGain();
+      g.gain.value = el === this.source.video ? 1 : 0;
+      node.connect(g).connect(this.gain);
+      this.elemGains.set(el, g);
+    }
     this.gain.connect(this.actx.destination);
     this.dest = this.actx.createMediaStreamDestination();
     this.gain.connect(this.dest);
@@ -256,6 +348,7 @@ export class Player {
     this.rate = at ? at.seg.rate : 1;
     this.applyRate();
     this.playing = true;
+    this.clockAt = 0;
     await this.source.play(this.rate);
   }
 
@@ -267,24 +360,29 @@ export class Player {
 
   applyRate() {
     this.source.setRate(this.rate);
-    this.ramp(this.wantGain(this.source.time()), 0.03);
+    const g = this.wantGain(this.source.time());
+    this.ramp(g, 0.03);
+    this.lastGain = g;
   }
 
-  /** Volume for this moment: silent while fast-forwarding or during a spoken command. @param {number} src */
+  /** Volume for this moment, from the plan. @param {number} src */
   wantGain(src) {
-    return this.rate > 1 || mutedAt(this.getPlan(), src) ? 0 : 1;
+    return gainAt(this.getPlan(), src);
   }
 
   /** @param {number} o */
   async seekOut(o) {
     this.fadeStart = 0;
     this.lastSrc = undefined;
+    this.trail = undefined;
     const plan = this.getPlan();
     const at = outToSrc(plan.segments, Math.max(0, Math.min(o, plan.outDuration)));
     if (!at) return;
     this.busy = true;
     await this.source.seek(at.src);
     this.busy = false;
+    this.clock = at.src;
+    this.clockAt = 0;
     this.out = srcToOut(plan.segments, at.src, plan.outDuration);
     this.rate = at.seg.rate;
     this.applyRate();
@@ -297,6 +395,18 @@ export class Player {
     this.step();
   }
 
+  /** Advance the smoothed clock towards the source's own. */
+  tickClock() {
+    const now = performance.now();
+    const raw = this.source.time();
+    if (this.playing && this.clockAt && !this.source.tick) {
+      const pred = this.clock + ((now - this.clockAt) / 1000) * this.rate;
+      this.clock = Math.abs(raw - pred) > 0.12 ? raw : pred + (raw - pred) * 0.2;
+    } else this.clock = raw;
+    this.clockAt = now;
+    return raw;
+  }
+
   step() {
     this.source.tick?.();
     if (this.busy) {
@@ -305,8 +415,9 @@ export class Player {
     }
     const plan = this.getPlan();
     if (this.playing) {
-      const src = this.source.time();
-      const seg = segmentAt(plan.segments, src);
+      const src = this.tickClock();
+      const segs = plan.segments;
+      const seg = segmentAt(segs, src);
       if (!seg || src >= this.source.duration - 0.03) {
         this.pause();
         this.out = plan.outDuration;
@@ -316,40 +427,66 @@ export class Player {
         return;
       }
       if (src < seg.src0 - 0.04) {
-        // We're inside a cut: jump to where the video resumes. Keep the last
-        // frame and dissolve from it, and dip the sound, so the cut is smooth.
-        this.busy = true;
-        this.snapshot();
-        this.ramp(0, 0.015);
-        this.onJump?.(true);
-        this.source.seek(seg.src0).then(() => {
-          this.busy = false;
-          this.fadeStart = performance.now();
-          this.lastSrc = seg.src0;
-          this.lastGain = this.wantGain(seg.src0);
-          this.ramp(this.lastGain, 0.05);
-          this.onJump?.(false);
-        });
+        // Already past the cut point (a slow frame): jump now.
+        this.jumpTo(seg);
         return;
+      }
+      const next = segs[segs.indexOf(seg) + 1];
+      if (next && next.src0 > seg.src1 + 0.04) {
+        if (seg.src1 - src < 1.5) this.source.prime?.(next.src0);
+        if (src >= seg.src1 - 0.02) {
+          this.jumpTo(next);
+          return;
+        }
       }
       if (seg.rate !== this.rate) {
         this.rate = seg.rate;
-        this.applyRate();
+        this.source.setRate(this.rate);
       }
-      // Silence spoken commands with a soft fade rather than a hard gap.
+      // Fade the sound for silenced commands, fast-forwards and cut edges.
       const g = this.wantGain(src);
       if (g !== this.lastGain) {
-        this.ramp(g, 0.05);
+        this.ramp(g, g ? 0.04 : 0.02);
         this.lastGain = g;
       }
       // A pause in the recording is a join in the footage: dissolve across it.
       const last = this.lastSrc ?? src;
       if (plan.joins.some((j) => last < j && src >= j)) this.snapshot(), (this.fadeStart = performance.now());
       this.lastSrc = src;
-      this.out = srcToOut(plan.segments, src, plan.outDuration);
+      this.out = srcToOut(segs, src, plan.outDuration);
       this.onTime(this.out);
     }
     this.paint();
+  }
+
+  /** Cut to where the next segment starts: switch decoders if one is ready, else seek. @param {import('./plan.js').Segment} seg */
+  jumpTo(seg) {
+    this.snapshot();
+    this.ramp(0, 0.012);
+    this.lastGain = 0;
+    const landed = () => {
+      this.fadeStart = performance.now();
+      this.lastSrc = seg.src0;
+      this.clock = seg.src0;
+      this.clockAt = 0;
+      this.rate = seg.rate;
+      this.source.setRate(seg.rate);
+      const g = this.wantGain(seg.src0 + 0.01);
+      this.ramp(g, 0.04);
+      this.lastGain = g;
+    };
+    if (this.source.canSwap?.(seg.src0) && this.source.swap) {
+      this.source.swap(seg.rate);
+      landed();
+      return;
+    }
+    this.busy = true;
+    this.onJump?.(true);
+    this.source.seek(seg.src0).then(() => {
+      this.busy = false;
+      landed();
+      this.onJump?.(false);
+    });
   }
 
   /** Remember the current frame for a crossfade. */
@@ -357,35 +494,66 @@ export class Player {
     const c = (this.fadeCanvas = this.fadeCanvas || document.createElement('canvas'));
     c.width = this.canvas.width;
     c.height = this.canvas.height;
-    /** @type {CanvasRenderingContext2D} */ (c.getContext('2d')).drawImage(this.canvas, 0, 0);
+    /** @type {CanvasRenderingContext2D} */ (c.getContext('2d')).drawImage(this.scene || this.canvas, 0, 0);
     this.fadeStart = 0;
   }
 
-  /** Smoothly move the volume, avoiding clicks at cuts. @param {number} to @param {number} tc */
+  /** Smoothly move the volume, avoiding clicks. @param {number} to @param {number} tc */
   ramp(to, tc) {
     if (!this.gain || !this.actx) return;
     const g = this.gain.gain;
-    g.cancelScheduledValues(this.actx.currentTime);
-    g.setTargetAtTime(to, this.actx.currentTime, tc);
+    const now = this.actx.currentTime;
+    g.cancelScheduledValues(now);
+    g.setValueAtTime(g.value, now);
+    g.setTargetAtTime(to, now, tc);
   }
 
   paint() {
     const plan = this.getPlan();
-    const src = this.source.time();
-    this.source.camera?.sync(src, this.playing, this.rate);
+    const src = this.playing ? this.clock : this.source.time();
+    this.source.camera?.sync(this.source.time(), this.playing, this.rate);
     const cam = this.source.camera && this.source.camera.width ? this.source.camera : null;
-    drawFrame(this.ctx, this.canvas.width, this.canvas.height, this.source, plan, src, this.out, this.rate, this.getLook(), cam);
-    // Crossfade from the frame before the cut.
+    const out = srcToOut(plan.segments, src, plan.outDuration);
+    drawFrame(this.ctx, this.canvas.width, this.canvas.height, this.source, plan, src, out, this.rate, this.getLook(), cam, (ctx) => this.blendScene(ctx));
+  }
+
+  /**
+   * Effects on the screen layer only (before the camera bubble, cards and
+   * captions are drawn on top): the fast-forward motion trail and the dissolve
+   * across a cut. Keeps a copy of the finished screen layer for the next cut.
+   * @param {CanvasRenderingContext2D} ctx
+   */
+  blendScene(ctx) {
+    const W = this.canvas.width, H = this.canvas.height;
+    const sized = (/** @type {HTMLCanvasElement | undefined} */ c) => {
+      const el = c || document.createElement('canvas');
+      if (el.width !== W || el.height !== H) (el.width = W), (el.height = H);
+      return el;
+    };
+    // Fast-forward: blend in the last frame for a motion trail.
+    if (this.playing && this.rate >= 2) {
+      const fresh = !this.trail || this.trail.width !== W || this.trail.height !== H;
+      const t = (this.trail = sized(this.trail));
+      if (!fresh) {
+        ctx.save();
+        ctx.globalAlpha = Math.min(0.55, 0.18 * Math.log2(this.rate) + 0.12);
+        ctx.drawImage(t, 0, 0);
+        ctx.restore();
+      }
+      /** @type {CanvasRenderingContext2D} */ (t.getContext('2d')).drawImage(this.canvas, 0, 0);
+    } else this.trail = undefined;
+    // Crossfade from the screen as it was before the cut.
     if (this.fadeStart && this.fadeCanvas) {
-      const k = (performance.now() - this.fadeStart) / 450;
-      const a = 1 - k;
-      if (a > 0) {
-        this.ctx.save();
-        this.ctx.globalAlpha = 1 - (1 - Math.pow(1 - k, 3)); // ease-out dissolve
-        this.ctx.drawImage(this.fadeCanvas, 0, 0);
-        this.ctx.restore();
+      const k = (performance.now() - this.fadeStart) / 420;
+      if (k < 1) {
+        ctx.save();
+        ctx.globalAlpha = 1 - k * k * (3 - 2 * k); // smoothstep dissolve
+        ctx.drawImage(this.fadeCanvas, 0, 0);
+        ctx.restore();
       } else this.fadeStart = 0;
     }
+    this.scene = sized(this.scene);
+    /** @type {CanvasRenderingContext2D} */ (this.scene.getContext('2d')).drawImage(this.canvas, 0, 0);
   }
 
   destroy() {

@@ -229,13 +229,15 @@ test('camera directions build a timeline with smooth transitions', async () => {
   const mid = cameraModeAt(plan, 3);
   assert.equal(mid.to, 'big');
   assert.equal(mid.k, 1);
-  const moving = cameraModeAt(plan, plan.camera[2].src + 0.25);
+  // The spoken command is cut, so the glide happens just after the cut, in output time.
+  const cutAt = plan.cuts.find((c) => c.src0 <= plan.camera[2].src && c.src1 >= plan.camera[2].src);
+  const moving = cameraModeAt(plan, (cutAt ? cutAt.src1 : plan.camera[2].src) + 0.25);
   assert.deepEqual([moving.from, moving.to], ['big', 'small']);
   assert.ok(moving.k > 0 && moving.k < 1);
   assert.equal(plan.cuts.filter((c) => c.reason === 'command').length, 3, 'camera directions are cut from the video');
 });
 
-test('demo mode keeps directions audible and plays would-be cuts fast', () => {
+test('demo mode keeps directions and fumbles audible, under a cut overlay', () => {
   const t = take(
     [P('Here we open the settings', 1, 4), P('then we click the uh, the thing', 5, 8), P('scratch that', 8.6, 9.6), P('then we click save', 10.2, 12.5)],
     14,
@@ -243,7 +245,7 @@ test('demo mode keeps directions audible and plays would-be cuts fast', () => {
   const final = buildPlan(t, { trimDeadAir: false });
   const demo = buildPlan(t, { trimDeadAir: false, showDirections: true });
   const ghost = demo.segments.find((s) => s.ghost === 'fumble');
-  assert.ok(ghost && ghost.rate === 3, 'the fumble plays fast');
+  assert.ok(ghost && ghost.rate > 1 && ghost.rate <= 1.3, 'the fumble plays a little faster and stays audible');
   assert.ok(ghost.src1 <= 8.6, 'the fumble ghost stops where "scratch that" begins');
   const said = demo.segments.find((s) => s.src0 <= 9 && s.src1 > 9);
   assert.equal(said.rate, 1, '"scratch that" is heard at normal speed');
@@ -311,4 +313,113 @@ test('phrase timing is re-measured from the voice', async () => {
   const [p] = refinePhrases({ duration: 10, phrases: [P('hello there', 2.6, 5.5)], levels: { dt, values }, motion: [] }, 0.04);
   assert.ok(Math.abs(p.start - 2) < 0.15, `start ${p.start}`);
   assert.ok(Math.abs(p.end - 4.1) < 0.15, `end ${p.end}`);
+});
+
+// ---------------------------------------------------------------- round 3: languages, timing, smoothness
+
+test('understands Spanish, French, German, Portuguese and Italian', () => {
+  const said = ['corta eso', 'oculta eso', 'acércate', 'dézoome', 'versteck das', 'corta isso', 'nascondi lo schermo', 'Capítulo: instalación', 'borra la última frase', 'pichhle 5 second kaat do'];
+  const cmds = parseCommands(said.map((s, i) => P(s, i * 3, i * 3 + 2)));
+  assert.deepEqual(cmds.map((c) => c.type), ['cut', 'hide', 'zoomIn', 'zoomOut', 'hide', 'cut', 'hideScreen', 'chapter', 'cutSentences', 'cutSeconds']);
+  assert.equal(cmds[7].label, 'Instalación');
+  assert.equal(cmds[9].seconds, 5);
+});
+
+test('"pause" is understood however the recogniser spells it, and only on its own', () => {
+  for (const s of ['pause', 'Pause.', 'pose', 'paws', 'hold on', 'one sec', 'ruko', 'pausa', 'pause the recording']) {
+    assert.equal(parseCommands([P(s, 0, 1)])[0]?.type, 'pause', s);
+  }
+  for (const s of ['we paused for lunch', 'you can pause the video any time', 'wait until it loads', 'take a break from coding and stretch']) {
+    assert.ok(!parseCommands([P(s, 0, 1)]).some((c) => c.type === 'pause'), s);
+  }
+  for (const s of ['resume', 'continue', 'chalu karo']) assert.equal(parseCommands([P(s, 0, 1)])[0]?.type, 'resume', s);
+});
+
+test('"pause" only counts where the recording really paused', () => {
+  const t = take([P('so this is the app', 0, 3), P('pause', 4, 4.6), P('and we are back', 5, 7)], 8);
+  const off = buildPlan(t, { trimDeadAir: false });
+  assert.equal(off.commands.find((c) => c.type === 'pause').enabled, false);
+  const on = buildPlan({ ...t, joins: [4.8] }, { trimDeadAir: false });
+  const pause = on.commands.find((c) => c.type === 'pause');
+  assert.equal(pause.enabled, true);
+  assert.ok(on.cuts.some((c) => c.by === pause.id && c.src0 <= 4 && c.src1 >= 4.6), 'the word "pause" is cut');
+});
+
+test('words are placed where the voice actually is', async () => {
+  const { alignWords } = await import('../src/plan.js');
+  // "hello" voiced 1.0–1.5, silence, "world" voiced 2.5–3.0.
+  const dt = 0.05, values = new Float32Array(80);
+  for (let t = 1; t < 1.5; t += dt) values[Math.floor(t / dt)] = 0.3;
+  for (let t = 2.5; t < 3; t += dt) values[Math.floor(t / dt)] = 0.3;
+  const [a, b] = alignWords('hello world', 0.8, 3.2, { dt, values }, 0.04);
+  assert.ok(a.start >= 0.95 && a.end <= 1.65, `hello ${a.start}-${a.end}`);
+  assert.ok(b.start >= 2.4 && b.start <= 2.6, `world starts ${b.start}`);
+});
+
+test('fast-forward eases in and out, and source↔output time stays exact', () => {
+  const t = take([P('speed this up', 2, 3), P('back to normal', 23, 24), P('done', 25, 26)], 27);
+  const plan = buildPlan(t, { trimDeadAir: false, speed: 4 });
+  const rates = plan.segments.map((s) => s.rate);
+  assert.ok(rates.some((r) => r > 1 && r < 4), `has ramp steps: ${rates.map((r) => r.toFixed(2))}`);
+  const iMax = rates.indexOf(4);
+  for (let i = 1; i <= iMax; i++) assert.ok(rates[i] >= rates[i - 1] - 1e-9, 'rate rises steadily');
+  for (let o = 0.1; o < plan.outDuration; o += 0.37) {
+    const { src } = outToSrc(plan.segments, o);
+    assert.ok(Math.abs(srcToOut(plan.segments, src, plan.outDuration) - o) < 1e-6);
+  }
+});
+
+test('narration is never fast-forwarded', () => {
+  const t = take([P('speed this up', 2, 3), P('this part matters so listen', 10, 13), P('normal speed', 23, 24)], 27);
+  const plan = buildPlan(t, { trimDeadAir: false, speed: 4 });
+  for (let s = 10; s < 12.6; s += 0.1) { // the voice runs 10 to 12.6 in this take
+    const seg = plan.segments.find((g) => s >= g.src0 && s < g.src1);
+    assert.ok(seg && seg.rate === 1, `normal speed at ${s.toFixed(1)}`);
+  }
+  assert.ok(plan.speeds.length >= 2, 'speeds up again after you stop talking');
+});
+
+test('the sound is already off when a silenced command starts, and before a cut', async () => {
+  const { gainAt } = await import('../src/plan.js');
+  const moving = motionLog(12, [{ t0: 0, t1: 12, x0: 10, x1: 20, y0: 10, y1: 20 }]);
+  const plan = buildPlan(take([P('look at the chart', 1, 3.5), P('zoom in', 4, 5), P('there it is', 6, 8)], 12, moving), { trimDeadAir: false });
+  const m = plan.mutes[0];
+  assert.ok(m.src0 <= 4 - 0.1, `mute starts before the voice (${m.src0})`);
+  assert.equal(gainAt(plan, m.src0 - 0.03), 0, 'already faded out just before the command');
+  assert.equal(gainAt(plan, 7), 1);
+  const cutPlan = buildPlan(take([P('hello and uh', 1, 3), P('scratch that', 3.5, 4.5), P('hello', 5, 6)], 8), { trimDeadAir: false });
+  const seg = cutPlan.segments[0];
+  assert.equal(gainAt(cutPlan, seg.src1 - 0.03), 0, 'faded out before the jump');
+});
+
+test('zoom glides never jump, even when "zoom out" interrupts "zoom in"', () => {
+  const t = take([P('zoom in', 2, 2.6), P('zoom out', 2.9, 3.4), P('zoom in on the top left', 6, 7), P('zoom in more', 9, 10), P('zoom out', 12, 13)], 16);
+  const plan = buildPlan(t, { trimDeadAir: false, commandStyle: 'mute' });
+  let prev = cameraAt(plan, 0);
+  for (let s = 0.02; s < 16; s += 0.02) {
+    const c = cameraAt(plan, s);
+    assert.ok(Math.abs(Math.log(c.scale / prev.scale)) < 0.05 && Math.abs(c.x - prev.x) < 0.02 && Math.abs(c.y - prev.y) < 0.02, `jump at ${s.toFixed(2)}`);
+    prev = c;
+  }
+  assert.ok(cameraAt(plan, 15.9).scale < 1.01, 'ends zoomed out');
+  assert.ok(cameraAt(plan, 11).scale > 2.5, '"more" went closer');
+});
+
+test('captions follow the words, leave out commands, and never overlap', () => {
+  const t = take([P('first we open the settings page', 1, 4), P('zoom in', 4.5, 5.2), P('then we change the theme to dark', 6, 9)], 11);
+  const plan = buildPlan(t, { trimDeadAir: false });
+  const text = plan.captions.map((c) => c.text).join(' ');
+  assert.ok(!/zoom/i.test(text), text);
+  assert.ok(/settings/.test(text) && /dark/.test(text));
+  for (let i = 1; i < plan.captions.length; i++) assert.ok(plan.captions[i].out0 >= plan.captions[i - 1].out1 - 1e-6, 'no overlap');
+  for (const c of plan.captions) assert.ok(c.words.every((w, k) => k === 0 || w.out0 >= c.words[k - 1].out0), 'word times rise');
+});
+
+test('the demo version never skips over speech', () => {
+  const t = take([P('so this is the uh the thing', 1, 4), P('scratch that', 4.5, 5.5), P('this is the dashboard', 6, 8), P('cut the last sentence', 8.5, 10), P('done', 12, 13)], 15);
+  const demo = buildPlan(t, { showDirections: true });
+  for (const p of t.phrases) for (let s = p.start + 0.1; s < p.end - 0.4; s += 0.1) {
+    const seg = demo.segments.find((g) => s >= g.src0 && s < g.src1);
+    assert.ok(seg && seg.rate <= 1.3, `audible at ${s.toFixed(1)} ("${p.text}")`);
+  }
 });

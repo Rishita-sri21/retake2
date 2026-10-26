@@ -5,7 +5,7 @@
  * browser; nothing is uploaded.
  */
 import { GRID_W, GRID_H, toGrid, diff } from './motion.js';
-import { parseCommands } from './commands.js';
+import { parseCommands, recordingControl } from './commands.js';
 
 /** @typedef {import('./commands.js').Phrase} Phrase */
 /** @typedef {import('./commands.js').Command} Command */
@@ -338,38 +338,91 @@ export class Recorder {
     }
     /** @type {Map<number, number>} first time each result index was heard */
     let firstSeen = new Map();
+    /** @type {Map<number, {type: string, whilePaused: boolean}>} results already acted on from interim speech */
+    let acted = new Map();
+    /** @type {Map<number, ReturnType<typeof setTimeout>>} */
+    const pending = new Map();
     this.listening = true;
+    /**
+     * The best reading of a result: the top transcript, unless only a lower
+     * alternative holds a command ("pose" vs "pause").
+     * @param {any} res
+     */
+    const best = (res) => {
+      const top = String(res[0]?.transcript || '').trim();
+      if (parseCommands([{ text: top, start: 0, end: 1 }]).length) return top;
+      for (let k = 1; k < res.length; k++) {
+        const alt = String(res[k]?.transcript || '').trim();
+        if (alt && (res[k].confidence === undefined || res[k].confidence === 0 || res[k].confidence > 0.2) && recordingControl(alt)) return alt;
+      }
+      return top;
+    };
+    /** Act on pause / resume / stop. @param {string} type */
+    const control = (type) => {
+      if (type === 'pause' && !this.paused) this.pause();
+      else if (type === 'resume' && this.paused) this.resume();
+      else if (type === 'stop') this.ev.onStopRequested?.();
+    };
     const open = () => {
       const r = new SR();
       r.lang = this.lang;
       r.continuous = true;
       r.interimResults = true;
+      r.maxAlternatives = 4;
       firstSeen = new Map();
+      acted = new Map();
+      for (const id of pending.values()) clearTimeout(id);
+      pending.clear();
       r.onresult = (/** @type {any} */ e) => {
         const t = this.now();
         let interim = '';
         for (let i = e.resultIndex; i < e.results.length; i++) {
           if (!firstSeen.has(i)) firstSeen.set(i, t);
           const res = e.results[i];
-          const text = res[0].transcript.trim();
+          const text = best(res);
           if (!text) continue;
-          if (res.isFinal) {
-            // Recognition reports the first words ~0.5s after they were spoken.
-            const start = Math.max(0, /** @type {number} */ (firstSeen.get(i)) - 0.6);
-            const phrase = { text, start, end: t };
-            const cmds = parseCommands([phrase]);
-            if (this.paused) {
-              // While paused, only listen for "resume" or "stop"; nothing else is kept.
-              if (cmds.some((c) => c.type === 'resume')) this.resume();
-              if (cmds.some((c) => c.type === 'stop')) this.ev.onStopRequested?.();
-              continue;
+          if (!res.isFinal) {
+            interim += ` ${text}`;
+            // "pause", "resume" and "stop" act the moment they're heard on
+            // their own, rather than when the recogniser finalises (1–2s later).
+            // Wait until the words have held still for 0.4s, so "pause the
+            // video player and…" doesn't pause the recording. "Stop" always
+            // waits for the final result.
+            const ctl = recordingControl(text);
+            clearTimeout(pending.get(i));
+            if (ctl && ctl !== 'stop' && !acted.has(i) && (ctl !== 'pause' || !this.paused) && (ctl !== 'resume' || this.paused)) {
+              pending.set(
+                i,
+                setTimeout(() => {
+                  if (acted.has(i)) return;
+                  acted.set(i, { type: ctl, whilePaused: this.paused });
+                  control(ctl);
+                }, 400),
+              );
             }
-            this.phrases.push(phrase);
-            this.ev.onPhrase?.(phrase);
-            for (const c of cmds) this.ev.onCommand?.(c);
-            if (cmds.some((c) => c.type === 'pause')) this.pause();
-            if (cmds.some((c) => c.type === 'stop')) this.ev.onStopRequested?.();
-          } else interim += ` ${text}`;
+            continue;
+          }
+          clearTimeout(pending.get(i));
+          // Recognition reports the first words ~0.5s after they were spoken.
+          const start = Math.max(0, /** @type {number} */ (firstSeen.get(i)) - 0.6);
+          const phrase = { text, start, end: Math.max(start + 0.2, t) };
+          const cmds = parseCommands([phrase]);
+          const early = acted.get(i);
+          if (early?.whilePaused || (this.paused && !early)) {
+            // Said while paused: nothing of it is in the video. Only act on it.
+            if (!early) {
+              if (cmds.some((c) => c.type === 'resume')) control('resume');
+              if (cmds.some((c) => c.type === 'stop')) control('stop');
+            }
+            continue;
+          }
+          this.phrases.push(phrase);
+          this.ev.onPhrase?.(phrase);
+          for (const c of cmds) this.ev.onCommand?.(c);
+          if (!early) {
+            if (cmds.some((c) => c.type === 'pause')) control('pause');
+            if (cmds.some((c) => c.type === 'stop')) control('stop');
+          }
         }
         this.ev.onInterim?.(interim.trim());
       };
@@ -465,5 +518,5 @@ export function speechThreshold(values) {
   if (sorted.length < 20) return 0.02;
   const q = (/** @type {number} */ p) => sorted[Math.min(sorted.length - 1, Math.floor(p * sorted.length))];
   const floor = q(0.15), voice = q(0.9);
-  return Math.max(0.004, floor + (voice - floor) * 0.22);
+  return Math.max(0.004, floor + (voice - floor) * 0.18);
 }

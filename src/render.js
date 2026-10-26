@@ -36,7 +36,7 @@ const ROSE = '#ec8f8f';
 /** @type {Look} */
 export const DEFAULT_LOOK = {
   captions: true,
-  captionSize: 0.042,
+  captionSize: 0.04,
   badge: true,
   watermark: false,
   camera: true,
@@ -62,7 +62,17 @@ let pix = /** @type {HTMLCanvasElement | null} */ (null);
  * @param {Look} look
  * @param {{frame: CanvasImageSource, width: number, height: number} | null} [camera]
  */
-export function drawFrame(ctx, W, H, source, plan, src, out, rate, look, camera = null) {
+/**
+ * When the opening title card gives way: as you start talking, but on screen
+ * for at least 2.4s and at most 3.6s.
+ * @param {import('./plan.js').Plan} plan
+ */
+export function titleUntil(plan) {
+  const first = plan.captions[0];
+  return first ? Math.max(2.4, Math.min(3.6, first.out0 + 0.2)) : 3.6;
+}
+
+export function drawFrame(ctx, W, H, source, plan, src, out, rate, look, camera = null, onScene = null) {
   const cam = cameraAt(plan, src);
   const s = cam.scale;
   const tx = Math.min(0, Math.max(W - W * s, W / 2 - cam.x * W * s));
@@ -152,29 +162,42 @@ export function drawFrame(ctx, W, H, source, plan, src, out, rate, look, camera 
     ctx.lineWidth = Math.max(3, H / 160);
     ctx.strokeRect(ctx.lineWidth / 2, ctx.lineWidth / 2, W - ctx.lineWidth, H - ctx.lineWidth);
     const label = ghost === 'dead-air' ? 'Dead air, trimmed in the final video' : 'Cut from the final video';
-    pill(ctx, W / 2, H * 0.035, label, `${rate}×`, ROSE, H, 'center');
+    pill(ctx, W / 2, H * 0.035, label, ghost === 'dead-air' ? `${rate}×` : '', ROSE, H, 'center');
     ctx.restore();
-  } else if (look.badge && rate > 1) {
-    pill(ctx, W - H * 0.03, H * 0.035, 'Fast-forward', `${rate}×`, CHAMPAGNE, H, 'right');
+  } else if (look.badge && rate > 1.3) {
+    // Name the speed asked for, fading in and out with the speed ramp.
+    const ff = plan.speeds.find((sp) => src >= sp.src0 - 1 && src < sp.src1 + 1);
+    const nominal = ff ? ff.rate : rate;
+    ctx.save();
+    ctx.globalAlpha = Math.min(1, (rate - 1) / Math.max(0.01, nominal - 1) + 0.15);
+    pill(ctx, W - H * 0.03, H * 0.035, 'Fast-forward', `${nominal}×`, CHAMPAGNE, H, 'right');
+    ctx.restore();
   }
+
+  // The screen layer is done: the player blends cut dissolves and motion
+  // trails here, so the bubble and text above stay crisp and never double.
+  onScene?.(ctx);
 
   if (camera && look.camera) drawCamera(ctx, W, H, camera, plan, src, look);
 
   // Demo mode: what you said, and what Retake did about it.
   if (plan.showDirections) {
-    const d = [...plan.directions].reverse().find((x) => src >= x.src0 && src <= x.src1);
+    // Chapter and title cards already show what they did.
+    const d = [...plan.directions].reverse().find((x) => src >= x.src0 && src <= x.src1 && x.type !== 'chapter' && x.type !== 'title');
     if (d) {
       const k = Math.min(1, (src - d.src0) / 0.25, (d.src1 - src) / 0.35);
       ctx.save();
       ctx.globalAlpha = Math.max(0, k);
-      directionCard(ctx, W, H, d.heard, d.did);
+      // Sit below the "cut from the final video" label when both show.
+      directionCard(ctx, W, H, d.heard, d.did, ghost ? H * 0.035 + Math.round(H * 0.028) * 2.1 + H * 0.018 : H * 0.035);
       ctx.restore();
     }
   }
 
   // Opening title card.
-  if (plan.title && out < 3.6) {
-    const k = Math.min(1, out / 0.4, (3.6 - out) / 0.6);
+  const titleEnd = titleUntil(plan);
+  if (plan.title && out < titleEnd) {
+    const k = Math.min(1, out / 0.4, (titleEnd - out) / 0.6);
     ctx.save();
     ctx.globalAlpha = k;
     const g = ctx.createLinearGradient(0, H * 0.35, 0, H);
@@ -182,15 +205,15 @@ export function drawFrame(ctx, W, H, source, plan, src, out, rate, look, camera 
     g.addColorStop(1, 'rgba(12,12,14,0.9)');
     ctx.fillStyle = g;
     ctx.fillRect(0, 0, W, H);
-    const fs = Math.round(H * 0.095);
+    const fs = Math.round(H * 0.1);
     ctx.font = `400 ${fs}px ${FONT_DISPLAY}`;
-    const lines = wrapLines(ctx, plan.title, W - H * 0.16).slice(0, 3);
-    const lh = fs * 1.02;
+    const lines = wrapLines(ctx, plan.title, Math.min(W - H * 0.16, W * 0.64)).slice(0, 3);
+    const lh = fs * 0.98;
     const lastY = H * 0.87;
     const firstY = lastY - (lines.length - 1) * lh;
-    ctx.font = `600 ${Math.round(H * 0.022)}px ${FONT_BODY}`;
+    ctx.font = `600 ${Math.round(H * 0.024)}px ${FONT_BODY}`;
     ctx.fillStyle = CHAMPAGNE;
-    letterSpaced(ctx, 'A RETAKE FILM', H * 0.08, firstY - fs - H * 0.015, H * 0.004);
+    letterSpaced(ctx, 'A RETAKE FILM', H * 0.08, firstY - fs * 0.92 - H * 0.02, H * 0.0055);
     ctx.font = `400 ${fs}px ${FONT_DISPLAY}`;
     ctx.fillStyle = IVORY;
     lines.forEach((l, i) => ctx.fillText(l, H * 0.08, firstY + i * lh));
@@ -201,48 +224,59 @@ export function drawFrame(ctx, W, H, source, plan, src, out, rate, look, camera 
   for (const c of plan.chapters) {
     const d = out - c.out;
     if (d < 0 || d > 3) continue;
-    if (plan.title && c.out < 3.6) continue; // the title card is showing
+    if (plan.title && c.out < titleEnd) continue; // the title card is showing
     const k = Math.min(1, d / 0.4, (3 - d) / 0.5);
     const e = 1 - Math.pow(1 - k, 3);
-    const fs = Math.round(H * 0.058);
+    const fs = Math.round(H * 0.062);
     ctx.save();
     ctx.globalAlpha = Math.min(1, k * 1.4);
     ctx.font = `italic 400 ${fs}px ${FONT_DISPLAY}`;
     const tw = ctx.measureText(c.title).width;
-    const w = tw + fs * 1.4, h = fs * 2.2;
+    const w = Math.max(tw, fs * 3) + fs * 1.4, h = fs * 2.25;
     const x = H * 0.05 - (1 - e) * H * 0.04, y = H * 0.06;
     ctx.fillStyle = INK;
     roundRect(ctx, x, y, w, h, h * 0.18);
     ctx.fill();
-    ctx.font = `600 ${Math.round(fs * 0.3)}px ${FONT_BODY}`;
+    ctx.font = `600 ${Math.round(fs * 0.34)}px ${FONT_BODY}`;
     ctx.fillStyle = CHAMPAGNE;
-    letterSpaced(ctx, `CHAPTER ${plan.chapters.indexOf(c) + 1}`, x + fs * 0.7, y + fs * 0.72, fs * 0.05);
+    letterSpaced(ctx, `CHAPTER ${plan.chapters.indexOf(c) + 1}`, x + fs * 0.7, y + fs * 0.76, fs * 0.06);
     ctx.font = `italic 400 ${fs}px ${FONT_DISPLAY}`;
     ctx.fillStyle = IVORY;
     ctx.fillText(c.title, x + fs * 0.7, y + fs * 1.75);
     ctx.restore();
   }
 
-  // Captions.
-  if (look.captions) {
+  // Captions: the current line, each word lighting up as it's spoken.
+  if (look.captions && !(plan.title && out < titleEnd - 0.25)) {
     const cap = plan.captions.find((c) => out >= c.out0 && out < c.out1);
     if (cap) {
       const fs = Math.round(H * look.captionSize);
-      const k = Math.min(1, (out - cap.out0) / 0.12, (cap.out1 - out) / 0.12);
+      const k = Math.min(1, (out - cap.out0) / 0.1, (cap.out1 - out) / 0.16);
       ctx.save();
       ctx.globalAlpha = Math.max(0, k);
       ctx.font = `500 ${fs}px ${FONT_BODY}`;
-      const lines = wrapLines(ctx, cap.text, W * 0.74);
-      const lh = fs * 1.35;
-      const boxW = Math.max(...lines.map((l) => ctx.measureText(l).width)) + fs * 1.5;
-      const boxH = lines.length * lh + fs * 0.6;
-      const x = (W - boxW) / 2, y = H - boxH - H * 0.055;
+      const lines = wrapLines(ctx, cap.text, W * 0.7);
+      const lh = fs * 1.38;
+      const space = ctx.measureText(' ').width;
+      const widths = lines.map((l) => ctx.measureText(l).width);
+      const boxW = Math.max(...widths) + fs * 1.6;
+      const boxH = lines.length * lh + fs * 0.62;
+      const x = (W - boxW) / 2, y = H - boxH - H * 0.06;
       ctx.fillStyle = INK;
-      roundRect(ctx, x, y, boxW, boxH, fs * 0.45);
+      roundRect(ctx, x, y, boxW, boxH, fs * 0.42);
       ctx.fill();
-      ctx.fillStyle = IVORY;
-      ctx.textAlign = 'center';
-      lines.forEach((l, i) => ctx.fillText(l, W / 2, y + fs * 0.3 + lh * (i + 0.76)));
+      let wi = 0;
+      lines.forEach((l, i) => {
+        let at = (W - widths[i]) / 2;
+        const by = y + fs * 0.31 + lh * (i + 0.76);
+        for (const w of l.split(' ')) {
+          const said = !cap.words || out >= (cap.words[wi]?.out0 ?? 0) - 0.04;
+          ctx.fillStyle = said ? IVORY : 'rgba(244,241,234,0.5)';
+          ctx.fillText(w, at, by);
+          at += ctx.measureText(w).width + space;
+          wi++;
+        }
+      });
       ctx.restore();
     }
   }
@@ -274,13 +308,13 @@ function letterSpaced(ctx, text, x, y, gap) {
  * @param {'left'|'center'|'right'} align
  */
 function pill(ctx, x, y, label, value, color, H, align) {
-  const fs = Math.round(H * 0.026);
+  const fs = Math.round(H * 0.028);
   ctx.save();
   ctx.font = `500 ${fs}px ${FONT_BODY}`;
   const lw = ctx.measureText(label).width;
   ctx.font = `600 ${fs}px ${FONT_BODY}`;
-  const vw = ctx.measureText(value).width;
-  const w = lw + vw + fs * 2.4, h = fs * 2.1;
+  const vw = value ? ctx.measureText(value).width : 0;
+  const w = lw + vw + fs * (value ? 2.4 : 1.8), h = fs * 2.1;
   const left = align === 'center' ? x - w / 2 : align === 'right' ? x - w : x;
   ctx.fillStyle = INK;
   roundRect(ctx, left, y, w, h, h / 2);
@@ -296,11 +330,11 @@ function pill(ctx, x, y, label, value, color, H, align) {
 
 /**
  * Demo-mode card: what was said (in italics) and what happened.
- * @param {CanvasRenderingContext2D} ctx @param {number} W @param {number} H @param {string} heard @param {string} did
+ * @param {CanvasRenderingContext2D} ctx @param {number} W @param {number} H @param {string} heard @param {string} did @param {number} top
  */
-function directionCard(ctx, W, H, heard, did) {
-  const fs = Math.round(H * 0.05);
-  const small = Math.round(fs * 0.5);
+function directionCard(ctx, W, H, heard, did, top) {
+  const fs = Math.round(H * 0.052);
+  const small = Math.round(fs * 0.56);
   ctx.font = `italic 400 ${fs}px ${FONT_DISPLAY}`;
   const q = `“${heard}”`;
   const qw = ctx.measureText(q).width;
@@ -308,8 +342,8 @@ function directionCard(ctx, W, H, heard, did) {
   const dw = ctx.measureText(did).width;
   const pad = fs * 0.8;
   const dot = fs * 0.5;
-  const w = Math.max(qw, dw) + pad * 2 + dot + fs * 0.4, h = fs * 2.35;
-  const x = (W - w) / 2, y = H * 0.03;
+  const w = Math.max(qw, dw) + pad * 2 + dot + fs * 0.4, h = fs * 2.45;
+  const x = (W - w) / 2, y = top;
   ctx.fillStyle = INK;
   roundRect(ctx, x, y, w, h, h * 0.22);
   ctx.fill();
@@ -327,7 +361,7 @@ function directionCard(ctx, W, H, heard, did) {
   ctx.fillText(q, tx, y + fs * 1.25);
   ctx.font = `500 ${small}px ${FONT_BODY}`;
   ctx.fillStyle = CHAMPAGNE;
-  ctx.fillText(did, tx, y + fs * 1.95);
+  ctx.fillText(did, tx, y + fs * 2.0);
 }
 
 /**
