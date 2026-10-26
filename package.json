@@ -1,0 +1,14 @@
+{
+  "name": "retake",
+  "version": "1.0.0",
+  "description": "A screen recorder you direct out loud: say 'scratch that', 'zoom here' or 'hide that' while you record and get a finished, captioned video.",
+  "type": "module",
+  "private": true,
+  "license": "MIT",
+  "scripts": {
+    "test": "node --test tests/*.test.js",
+    "dev": "node scripts/serve.js",
+    "start": "node scripts/serve.js"
+  },
+  "engines": { "node": ">=18" }
+}
