@@ -41,6 +41,7 @@
  * @property {boolean} standalone  The phrase is (almost) only the command.
  * @property {number} before       Narration words before the command in the same phrase.
  * @property {[number, number]} span  Word indices [first, last] of the command in the phrase, modifiers included.
+ * @property {'before'|'after'} [needsPause]  Said at the edge of a longer phrase: only counts if there's a pause on this side of it.
  * @property {string} [label]      Title text for chapter/title.
  * @property {number} [seconds]    "for 10 seconds", "last 5 seconds".
  * @property {number} [count]      "last two sentences".
@@ -144,7 +145,7 @@ export const GRAMMAR = [
     name: 'Cut the fumble',
     say: 'scratch that',
     patterns: [
-      L(`scratch that|cut that(?: out)?|cut cut|delete that|remove that|take that out|strike that|let me redo(?: that)?|redo that|let me (?:try|start|say|do) (?:that |it )?(?:again|over)|start (?:that )?over|take two|retake|let me rephrase`),
+      L(`scratch that|cut that(?: out)?|cut cut|delete that|remove that|take that out|strike that|let me redo(?: that)?|redo that|let me (?:try|start|say|do) (?:that |it )?(?:again|over)|start (?:that )?over|let me rephrase`),
       L(`kaat do|cut karo|isko hata do|ye hata do|hata do|dobara (?:karta|karti|bolta|bolti) (?:hoon|hun)|phir se (?:bolta|bolti) (?:hoon|hun)`),
       L(`काट दो|हटा दो|फिर से बोलता हूँ|दोबारा करता हूँ|दोबारा बोलता हूँ`),
       L(`corta eso|borra eso|quita eso|elimina eso|coupe (?:ca|cela)|efface (?:ca|cela)|je recommence|on recommence|schneid das (?:raus|weg)|streich das|losch das|corta isso|apaga isso|taglia (?:questo|quello)|cancella (?:questo|quello)|rifaccio`),
@@ -158,7 +159,8 @@ export const GRAMMAR = [
     hidden: true,
     standaloneOnly: true,
     exact: true,
-    patterns: [L(`oops|my bad|never ?mind|ignore that|undo(?: that)?|one more time|try again|again|do over|phir se|galti ho gayi|फिर से|otra vez|de nuevo|encore une fois|nochmal|noch ?mal|de novo|di nuovo`)],
+    // Speech recognition's usual spellings of a quick "scratch that" are here too.
+    patterns: [L(`oops|my bad|never ?mind|ignore that|undo(?: that)?|one more time|try again|again|do over|phir se|galti ho gayi|फिर से|otra vez|de nuevo|encore une fois|nochmal|noch ?mal|de novo|di nuovo|scratched that|scratches that|scratch it|scratch this|stretch that|scratch dat|scratch|crash that|cross that out|cross that|wrong take|bad take|take two|retake|let'?s retake|retake that`)],
   },
   // ---------------------------------------------------------------- hiding
   {
@@ -397,7 +399,7 @@ export const GRAMMAR = [
     say: 'small camera',
     standaloneOnly: true,
     patterns: [
-      L(`(?:small|smaller|little|mini) ?(?:camera|cam|camra|kamera)|(?:camera|cam) (?:small|smaller|in (?:the |to the )?corner|to (?:the )?corner)|back to (?:the )?screen|show the screen now`),
+      L(`(?:small|smaller|little|mini) ?(?:camera|cam|camra|kamera)|(?:camera|cam) (?:small|smaller|in (?:the |to the )?corner|to (?:the )?corner)|(?:go |come |and )?back to (?:the |this |my |your )?(?:screen|screens|scream|screen share|desktop|demo|code)|back to it|back to work|show the screen now|shrink (?:the |my )?camera|face away`),
       L(`camera chhota (?:karo|kar do)|chhota camera|screen pe wapas|कैमरा छोटा करो|छोटा कैमरा`),
       L(`camara pequena|vuelve a la pantalla|petite camera|retour a l'ecran|kleine kamera|zuruck zum bildschirm|camera pequena|volta para a tela|camera piccola|torna allo schermo`),
     ],
@@ -580,8 +582,23 @@ export function parseCommands(phrases) {
         // Modifier words ("for ten seconds", "top left", "8x", "more") aren't narration.
         const strip = (/** @type {string} */ t) => MODIFIERS.reduce((acc, r) => acc.replace(new RegExp(r.source, 'gu'), ' '), t);
         const narration = [...words(strip(beforeText)), ...words(strip(afterText))].filter((w) => !FILLER.has(w));
-        if (g.standaloneOnly && !strong && narration.length > (g.exact ? 0 : 1)) continue;
-        found.push({ g, m, a, b, strong, narration, beforeText, order });
+        /** @type {'before' | 'after' | undefined} */
+        let needsPause;
+        if (g.standaloneOnly && !strong && narration.length > (g.exact ? 0 : 1)) {
+          // Speech recognition often runs a command into the next sentence
+          // ("back to the screen so here we have…"). A camera command at the
+          // very start or end of a phrase still counts, if the recording shows
+          // a pause between it and the rest (checked by the planner), and it
+          // isn't part of a noun phrase ("we bought a big camera").
+          if (g.exact || !g.type.startsWith('cam')) continue;
+          const pre = words(strip(beforeText)).filter((w) => !FILLER.has(w));
+          const post = words(strip(afterText)).filter((w) => !FILLER.has(w));
+          const lastBefore = words(beforeText).pop() || '';
+          if (!pre.length) needsPause = 'after';
+          else if (!post.length && !/^(?:a|an|the|my|our|your|his|her|their|this|that|new|old|one|bought|have|has|got|using|use|with)$/.test(lastBefore)) needsPause = 'before';
+          else continue;
+        }
+        found.push({ g, m, a, b, strong, narration, beforeText, order, needsPause });
         break;
       }
     });
@@ -590,7 +607,7 @@ export function parseCommands(phrases) {
     const claimed = [];
     const taken = new Set();
     const mods = modifiers(text);
-    for (const { g, m, a, b, strong, narration, beforeText } of found) {
+    for (const { g, m, a, b, strong, narration, beforeText, needsPause } of found) {
       if (taken.has(g.type) || claimed.some(([x, y]) => a < y && b > x)) continue;
       claimed.push([a, b]);
       taken.add(g.type);
@@ -608,6 +625,7 @@ export function parseCommands(phrases) {
         span: labelled ? [0, text.split(' ').length - 1] : commandSpan(text, a, b),
         enabled: true,
       };
+      if (needsPause) cmd.needsPause = needsPause;
       const n = m.slice(1).find((x) => x !== undefined);
       if (labelled && m.indices?.[1]) {
         const [la, lb] = m.indices[1];

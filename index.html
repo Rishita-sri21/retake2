@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>Retake</title>
-  <meta name="description" content="A screen recorder you direct out loud. Say “scratch that”, “zoom in” or “hide that” while you record, and get a finished, captioned video with no editing.">
+  <meta name="description" content="Edit out loud. Retake is a screen recorder that takes direction: say “scratch that”, “zoom in” or “hide that” while you record, and stop with a finished, captioned video.">
   <meta name="theme-color" content="#0e0e10">
   <link rel="icon" href="assets/icon.svg" type="image/svg+xml">
   <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -19,21 +19,28 @@
       <svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true"><circle cx="16" cy="16" r="14.5" fill="none" stroke="#e8c9a0" stroke-width="1.5"/><circle cx="16" cy="16" r="5" fill="#e5534b"/></svg>
       <span class="brand-name">Retake</span>
     </a>
-    <span class="topbar-note">Edit by voice, while you record</span>
+    <span class="topbar-note">No timeline. No editing. Just say it.</span>
   </header>
 
   <main>
     <!-- ============================================================ HOME -->
     <section id="home" class="screen">
       <div class="hero">
-        <p class="eyebrow">A screen recorder you direct out loud</p>
-        <h1>Say <em>“scratch that”</em><br>and it’s gone.</h1>
-        <p class="lede">Record your screen and talk as you normally would. Fumbled a sentence? Say <b>“scratch that”</b>. Text too small? <b>“Zoom in.”</b> Pasted an API key on screen? <b>“Hide that.”</b> When you stop, the video is already edited, captioned and split into chapters.</p>
-        <div class="hero-actions">
-          <button class="btn primary" id="record" type="button"><span class="dot" aria-hidden="true"></span>Start recording</button>
-          <button class="btn soft" id="try-sample" type="button">Try the sample take</button>
-          <button class="btn soft" id="open-last" type="button" hidden>Open last take</button>
+        <div class="hero-copy">
+          <p class="eyebrow">A screen recorder that takes direction</p>
+          <h1>Edit<br><em>out loud.</em></h1>
+          <p class="lede">Talk through your demo the way you always do. Fumble a line, say <b>“scratch that”</b>, and it’s gone. Say <b>“zoom in”</b>, <b>“hide that”</b> or <b>“big camera”</b>, and it happens right there in the take. Hit stop, and your video is already cut, zoomed, blurred, captioned and chaptered.</p>
+          <div class="hero-actions">
+            <button class="btn primary" id="record" type="button"><span class="dot" aria-hidden="true"></span>Start recording</button>
+            <button class="btn soft" id="try-sample" type="button">Try the sample take</button>
+            <button class="btn soft" id="open-last" type="button" hidden>Open last take</button>
+          </div>
         </div>
+        <figure class="take-demo" aria-label="Example: what Retake hears and does while you record">
+          <div class="td-head"><span class="td-rec"><i></i>REC</span><span class="td-time" id="td-time">00:00</span></div>
+          <ol class="td-lines" id="td-lines"></ol>
+          <figcaption class="td-foot">What Retake hears, and what it does about it</figcaption>
+        </figure>
         <div class="setup">
           <label class="field">
             <span>I’ll be speaking</span>
@@ -67,8 +74,8 @@
           <h3>And without being asked</h3>
           <ul>
             <li><b>Dead air trimmed</b> where nothing happens on screen. Silences while you type are kept.</li>
-            <li><b>Smooth cuts</b> with a soft crossfade and no audio clicks.</li>
-            <li><b>Captions</b> burned in, plus .srt and .vtt files.</li>
+            <li><b>Cuts you can’t hear.</b> Sound is cut to the exact sample, and spoken commands never make it into the final video.</li>
+            <li><b>Captions timed to each word</b>, burned in, plus .srt and .vtt files.</li>
             <li><b>YouTube chapters</b> ready to paste into the description.</li>
             <li><b>Private.</b> Everything happens in this browser. Nothing is uploaded.</li>
           </ul>

@@ -68,13 +68,13 @@ export const DEFAULTS = {
   commandStyle: 'smart',
   showDirections: false,
   ghostRate: 3,
-  fumbleRate: 1.25,
+  fumbleRate: 1,
 };
 
 /** Playback faster than this is silent (fast-forward); slower keeps the voice. */
 export const AUDIBLE_RATE = 1.3;
 /** Output seconds a zoom takes to glide. */
-export const ZOOM_GLIDE = 1.1;
+export const ZOOM_GLIDE = 0.9;
 /** Output seconds the camera bubble takes to change size. */
 export const CAM_GLIDE = 0.7;
 
@@ -183,7 +183,7 @@ export function refinePhrases(take, threshold) {
   take.phrases.forEach((p, i) => {
     const floor = i > 0 ? out[i - 1].end + 0.02 : 0;
     let start = Math.max(p.start, floor), end = p.end;
-    // End: walk back from the reported end to the last voiced moment.
+    // End, first guess: walk back from the reported end to the last voiced moment.
     for (let t = p.end; t >= Math.max(start, p.end - 2.5); t -= dt) {
       if (at(t)) {
         end = Math.floor(t / dt) * dt + dt + 0.06;
@@ -210,11 +210,38 @@ export function refinePhrases(take, threshold) {
       start = Math.floor(t / dt) * dt;
     }
     start = Math.max(floor, start - 0.04);
+    // End, properly: the recogniser finalises a phrase 1–2s late, often after
+    // you've started the next sentence, so the walk-back above can land in
+    // the next sentence. Instead walk *forward* from the start through the
+    // voice, and stop at the pause where this phrase's words have been said:
+    // once about as much voice as its syllables need has passed, and the
+    // voice that follows is when the recogniser heard the next phrase begin.
+    const next = take.phrases[i + 1];
+    const nextFrom = next ? next.start - 0.9 : Infinity;
+    const need = 0.8 * Math.max(0.3, sentenceSyllables(p.text) / 5.5);
+    let voicedFor = 0;
+    for (let t = start; t < Math.min(end, take.duration); ) {
+      if (at(t)) {
+        voicedFor += dt;
+        t += dt;
+        continue;
+      }
+      const gap = t;
+      while (t < end && !at(t)) t += dt;
+      if (t >= end) break; // the voice just stopped: the walk-back was right
+      if (voicedFor >= need && t >= nextFrom) {
+        end = gap + 0.06;
+        break;
+      }
+    }
     if (end <= start + 0.2) end = Math.max(p.end, start + 0.4);
     out.push({ text: p.text, start, end: Math.min(take.duration, end) });
   });
   return out;
 }
+
+/** Syllables in a whole phrase. @param {string} text */
+const sentenceSyllables = (text) => text.split(/\s+/).reduce((n, w) => n + syllables(w), 0);
 
 /** Rough syllable count, the unit speech time is spread over. @param {string} w */
 function syllables(w) {
@@ -376,15 +403,113 @@ export function buildPlan(take, options = {}) {
   const P = refinePhrases(take, o.levelThreshold);
   const W = P.map((p) => alignWords(p.text, p.start, p.end, take.levels, o.levelThreshold));
   const joins = take.joins || [];
+  const hasLevels = take.levels.values.length > 0;
+  const mask = hasLevels ? voiceMask(take.levels, o.levelThreshold) : new Uint8Array(0);
+  const ldt = take.levels.dt;
+  const quietAt = (/** @type {number} */ t) => hasLevels && !voiced(mask, ldt, t);
+  /** The nearest pause to t, looking `back` (or forward), within `reach` seconds; else t. */
+  const toGap = (/** @type {number} */ t, /** @type {boolean} */ back, reach = 0.35) => {
+    if (!hasLevels) return t;
+    for (let d = 0; d <= reach; d += ldt) {
+      const x = back ? t - d : t + d;
+      if (quietAt(x)) return back ? x + ldt : x;
+    }
+    return t;
+  };
+  /**
+   * When the command's own words start and end. Inside a longer phrase the
+   * aligned word times are snapped to the pause around the command, since
+   * people nearly always pause, however briefly, before giving a direction.
+   */
+  const cmdTimes = (/** @type {Command} */ c) => {
+    const w = W[c.phrase], p = P[c.phrase];
+    if (c.standalone || !w.length) return { start: p.start, end: p.end };
+    const a = w[Math.min(c.span[0], w.length - 1)], b = w[Math.min(c.span[1], w.length - 1)];
+    // Best: the stretch of voice between two pauses that is about as long as
+    // the command and closest to where alignment put it. Speaking rates vary
+    // (a fumble is slow), so this beats spreading syllables evenly.
+    const isl = islandFor(c, a.start, b.end);
+    if (isl) return isl;
+    const start = c.span[0] === 0 ? p.start : Math.max(p.start, toGap(a.start + 0.12, true));
+    const end = c.span[1] >= w.length - 1 ? p.end : Math.min(p.end, toGap(b.end - 0.12, false));
+    return { start, end: Math.max(end, start + 0.2) };
+  };
+  /** Stretches of voice (between pauses) inside [a, b]. @param {number} a @param {number} b */
+  const islandsIn = (a, b) => {
+    /** @type {{start: number, end: number}[]} */
+    const out = [];
+    if (!hasLevels) return out;
+    let s0 = -1;
+    for (let x = Math.max(0, a); x <= b + ldt; x += ldt) {
+      const on = x <= b && !quietAt(x);
+      if (on && s0 < 0) s0 = x;
+      if (!on && s0 >= 0) out.push({ start: s0, end: x }), (s0 = -1);
+    }
+    return out;
+  };
+  /** @param {Command} c @param {number} alignedStart @param {number} alignedEnd */
+  const islandFor = (c, alignedStart, alignedEnd) => {
+    const p = P[c.phrase];
+    const words = p.text.normalize('NFC').replace(/\s+/g, ' ').trim().split(' ').slice(c.span[0], c.span[1] + 1).join(' ');
+    const expected = Math.max(0.3, sentenceSyllables(words) / 4.5);
+    const isl = islandsIn(p.start - 0.1, p.end + 0.1);
+    if (isl.length < 2) return null;
+    const mid = (alignedStart + alignedEnd) / 2;
+    let best = null, bestScore = Infinity;
+    for (let i = 0; i < isl.length; i++) {
+      for (let j = i; j < Math.min(isl.length, i + 2); j++) {
+        const start = isl[i].start, end = isl[j].end, dur = end - start;
+        if (dur < expected * 0.4 || dur > expected * 2.2 + 0.3) continue;
+        // A command at the very start or end of the phrase sits in the first or last stretch.
+        if (c.span[0] === 0 && i !== 0) continue;
+        if (c.span[1] >= W[c.phrase].length - 1 && j !== isl.length - 1) continue;
+        const score = Math.abs((start + end) / 2 - mid) + Math.abs(dur - expected) * 0.5;
+        if (score < bestScore && Math.abs((start + end) / 2 - mid) < 1.6) (best = { start, end }), (bestScore = score);
+      }
+    }
+    return best;
+  };
+  /** Is there a pause just before (or after) t? */
+  const pauseNear = (/** @type {number} */ t, /** @type {'before'|'after'} */ side) => {
+    if (!hasLevels) return true;
+    const [a, b] = side === 'before' ? [t - 0.5, t + 0.12] : [t - 0.12, t + 0.5];
+    for (let x = a; x <= b; x += ldt) if (quietAt(x)) return true;
+    return false;
+  };
   const commands = parseCommands(P).map((c) => {
     const cmd = { ...c, enabled: !disabled.has(c.id), effect: '' };
+    // Switched on by hand in the editor: trust that over any guess below.
+    const forced = disabled.has(`on:${c.id}`);
     // "pause"/"resume" only mean something where the recording really paused;
     // anywhere else it was just a word in a sentence.
     const p = P[c.phrase];
-    if (c.type === 'pause' && !joins.some((j) => j >= p.start - 0.5 && j <= p.end + 3)) (cmd.enabled = false), (cmd.effect = 'The recording didn’t pause here');
-    if (c.type === 'resume' && !joins.some((j) => j >= p.start - 4 && j <= p.start + 0.6)) (cmd.enabled = false), (cmd.effect = 'Nothing was paused here');
+    if (!forced && c.type === 'pause' && !joins.some((j) => j >= p.start - 0.5 && j <= p.end + 3)) (cmd.enabled = false), (cmd.effect = 'The recording didn’t pause here');
+    if (!forced && c.type === 'resume' && !joins.some((j) => j >= p.start - 4 && j <= p.start + 0.6)) (cmd.enabled = false), (cmd.effect = 'Nothing was paused here');
+    // A camera command run into a sentence counts only if you paused around it.
+    if (!forced && c.needsPause) {
+      const w = W[c.phrase];
+      const edgeT = w.length ? (c.needsPause === 'before' ? w[Math.min(c.span[0], w.length - 1)].start : w[Math.min(c.span[1], w.length - 1)].end) : p.start;
+      if (!pauseNear(edgeT, c.needsPause)) (cmd.enabled = false), (cmd.effect = 'Sounded like part of a sentence, so it was left alone');
+    }
     return cmd;
   });
+  // Re-time the words around each command found inside a longer phrase: the
+  // narration before it fits between the phrase start and the command, the
+  // narration after it between the command and the phrase end. (Spreading the
+  // whole phrase evenly would let a slow fumble push words across the command.)
+  for (const c of commands) {
+    if (c.standalone || !c.enabled || c.type === 'chapter' || c.type === 'title') continue;
+    const w = W[c.phrase], p = P[c.phrase];
+    if (!w.length) continue;
+    const t = cmdTimes(c);
+    const words = p.text.normalize('NFC').replace(/\s+/g, ' ').trim().split(' ');
+    const a = c.span[0], b = Math.min(c.span[1], words.length - 1);
+    W[c.phrase] = [
+      ...alignWords(words.slice(0, a).join(' '), p.start, Math.max(p.start, t.start - 0.05), take.levels, o.levelThreshold),
+      ...alignWords(words.slice(a, b + 1).join(' '), t.start, t.end, take.levels, o.levelThreshold),
+      ...alignWords(words.slice(b + 1).join(' '), Math.min(p.end, t.end + 0.05), p.end, take.levels, o.levelThreshold),
+    ];
+  }
   const live = commands.filter((c) => c.enabled);
   const nextOf = (/** @type {Command} */ c, /** @type {string[]} */ types) =>
     live.find((d) => d.phrase > c.phrase && types.includes(d.type));
@@ -394,13 +519,6 @@ export function buildPlan(take, options = {}) {
     const list = [];
     for (let k = i - 1; k >= 0; k--) if (!isCommandPhrase(k)) list.push(k);
     return list;
-  };
-  /** When the command's own words start and end (aligned), not just the phrase. */
-  const cmdTimes = (/** @type {Command} */ c) => {
-    const w = W[c.phrase], p = P[c.phrase];
-    if (c.standalone || !w.length) return { start: p.start, end: p.end };
-    const a = w[Math.min(c.span[0], w.length - 1)], b = w[Math.min(c.span[1], w.length - 1)];
-    return { start: a.start, end: b.end };
   };
 
   /** @type {Cut[]} */
@@ -425,14 +543,15 @@ export function buildPlan(take, options = {}) {
 
   for (const c of live) {
     const p = P[c.phrase], words = W[c.phrase];
+    // Generous margins: silencing costs nothing (the picture carries on), and
+    // speech recognition's timing is never exact.
     if (c.standalone) {
-      // From just before the voice starts (fade out in time) to just after it stops.
-      spoken.push({ src0: clamp(p.start - 0.14), src1: clamp(p.end + 0.08), by: c.id, type: c.type, edge: true });
-    } else if (words.length && (c.span[0] === 0 || c.span[1] >= words.length - 1)) {
-      // A command at the start or end of a sentence ("...so zoom in"): silence just its words.
+      spoken.push({ src0: clamp(p.start - 0.2), src1: clamp(p.end + 0.16), by: c.id, type: c.type, edge: true });
+    } else if (words.length) {
+      // Inside a longer phrase: silence just the command's words, wherever they are.
       const t = cmdTimes(c);
-      const atStart = c.span[0] === 0;
-      spoken.push({ src0: clamp((atStart ? p.start : t.start) - 0.1), src1: clamp((atStart ? t.end : p.end) + 0.06), by: c.id, type: c.type, edge: !atStart });
+      const atStart = c.span[0] === 0, atEnd = c.span[1] >= words.length - 1;
+      spoken.push({ src0: clamp((atStart ? p.start : t.start) - 0.14), src1: clamp((atEnd ? p.end : t.end) + 0.12), by: c.id, type: c.type, edge: atEnd && !atStart });
     }
   }
 
@@ -446,29 +565,30 @@ export function buildPlan(take, options = {}) {
         // otherwise it's the sentence before.
         const prev = narrationBefore(c.phrase)[0];
         const from = c.before >= 3 || prev === undefined ? p.start : P[prev].start;
-        cuts.push({ src0: clamp(from - 0.06), src1: clamp(p.end + 0.08), reason: 'fumble', by: c.id });
-        c.effect = `Removed ${(p.end - from).toFixed(1)}s`;
+        // Up to the end of "scratch that" itself: a retake said in the same breath stays.
+        cuts.push({ src0: clamp(from - 0.06), src1: clamp(t.end + 0.1), reason: 'fumble', by: c.id });
+        c.effect = `Removed ${(t.end - from).toFixed(1)}s`;
         break;
       }
       case 'cutSentences': {
         const list = narrationBefore(c.phrase);
         const n = Math.max(1, Math.min(list.length, Math.round(c.count || 1)));
         const from = list.length ? P[list[n - 1]].start : p.start;
-        cuts.push({ src0: clamp(from - 0.06), src1: clamp(p.end + 0.08), reason: 'cut', by: c.id });
-        c.effect = `Removed ${n} sentence${n > 1 ? 's' : ''} (${(p.end - from).toFixed(1)}s)`;
+        cuts.push({ src0: clamp(from - 0.06), src1: clamp(t.end + 0.1), reason: 'cut', by: c.id });
+        c.effect = `Removed ${n} sentence${n > 1 ? 's' : ''} (${(t.end - from).toFixed(1)}s)`;
         break;
       }
       case 'cutSeconds': {
-        const from = clamp(p.start - (c.seconds || 5));
-        cuts.push({ src0: from, src1: clamp(p.end + 0.08), reason: 'cut', by: c.id });
-        c.effect = `Removed ${(p.end - from).toFixed(1)}s`;
+        const from = clamp(t.start - (c.seconds || 5));
+        cuts.push({ src0: from, src1: clamp(t.end + 0.1), reason: 'cut', by: c.id });
+        c.effect = `Removed ${(t.end - from).toFixed(1)}s`;
         break;
       }
       case 'cutFrom': {
         const to = nextOf(c, ['cutTo', 'stop']);
-        const end = to ? clamp(P[to.phrase].end + 0.08) : D;
-        cuts.push({ src0: clamp(p.start - 0.06), src1: end, reason: 'cut', by: c.id });
-        c.effect = to ? `Removed ${(end - p.start).toFixed(1)}s, up to “${to.heard}”` : 'Removed everything after this (no “cut till here” was heard)';
+        const end = to ? clamp(cmdTimes(to).end + 0.1) : D;
+        cuts.push({ src0: clamp(t.start - 0.06), src1: end, reason: 'cut', by: c.id });
+        c.effect = to ? `Removed ${(end - t.start).toFixed(1)}s, up to “${to.heard}”` : 'Removed everything after this (no “cut till here” was heard)';
         break;
       }
       case 'cutTo':
@@ -508,19 +628,19 @@ export function buildPlan(take, options = {}) {
         const x = Math.min(1 - half, Math.max(half, target[0]));
         const y = Math.min(1 - half, Math.max(half, target[1]));
         // Start the glide as you say it, so it lands as you finish.
-        const at = clamp(t.start + 0.25);
+        const at = clamp(t.start + 0.05);
         view.push({ src: at, scale, x, y, by: c.id });
         if (c.seconds) view.push({ src: clamp(at + c.seconds), scale: 1, x: 0.5, y: 0.5 });
         c.effect = `${String(Math.round(scale * 10) / 10)}× on the ${c.region ? c.region.replace('-', ' ') : c.more ? 'same spot' : 'centre'}${c.seconds ? ` for ${c.seconds}s` : ''}`;
         break;
       }
       case 'zoomOut':
-        view.push({ src: clamp(t.start + 0.25), scale: 1, x: 0.5, y: 0.5, by: c.id });
+        view.push({ src: clamp(t.start + 0.05), scale: 1, x: 0.5, y: 0.5, by: c.id });
         c.effect = 'Back to the full screen';
         break;
       case 'highlight': {
         const f = focusAt(take.motion, p.end, 2.5);
-        spots.push({ src0: clamp(t.start + 0.2), src1: clamp(after + (c.seconds || 2.8)), x: f ? f.x : 0.5, y: f ? f.y : 0.5, by: c.id });
+        spots.push({ src0: clamp(t.start + 0.05), src1: clamp(after + (c.seconds || 2.8)), x: f ? f.x : 0.5, y: f ? f.y : 0.5, by: c.id });
         c.effect = f ? 'Spotlight on what just changed' : 'Spotlight on the centre';
         break;
       }
@@ -572,7 +692,7 @@ export function buildPlan(take, options = {}) {
       case 'camHide': {
         const mode = c.type === 'camBig' ? 'big' : c.type === 'camHide' ? 'hidden' : 'small';
         // Start the move while you're still saying it, so it's part of the shot.
-        camera.push({ src: clamp(t.start + 0.15), mode, by: c.id });
+        camera.push({ src: clamp(t.start + 0.05), mode, by: c.id });
         c.effect = mode === 'big' ? 'Your face fills the frame' : mode === 'hidden' ? 'Camera bubble hidden' : 'Camera bubble back in place';
         break;
       }

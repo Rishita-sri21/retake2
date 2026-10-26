@@ -4,7 +4,7 @@
  * at speed, and draws every frame with the renderer. The export is the same
  * loop running onto a recorded canvas.
  */
-import { segmentAt, srcToOut, outToSrc, gainAt } from './plan.js';
+import { segmentAt, srcToOut, outToSrc, gainAt, AUDIBLE_RATE } from './plan.js';
 import { drawFrame } from './render.js';
 import { drawSample, drawPresenter, SAMPLE_W, SAMPLE_H, SAMPLE_DURATION } from './sample.js';
 
@@ -24,6 +24,7 @@ import { drawSample, drawPresenter, SAMPLE_W, SAMPLE_H, SAMPLE_DURATION } from '
  * @property {(rate: number) => void} setRate
  * @property {() => void} [tick]
  * @property {HTMLVideoElement} [video]
+ * @property {Blob} [blob]                     The recording, for decoding its sound.
  * @property {() => HTMLVideoElement[]} [elements]
  * @property {(t: number) => void} [prime]      Get the standby decoder ready at t.
  * @property {(t: number) => boolean} [canSwap] Is the standby decoder ready at t?
@@ -74,6 +75,7 @@ export class CameraTrack {
 export class VideoSource {
   /** @param {Blob} blob @param {number} knownDuration */
   constructor(blob, knownDuration) {
+    this.blob = blob;
     this.url = URL.createObjectURL(blob);
     this.video = this.make();
     /** @type {HTMLVideoElement} */
@@ -266,9 +268,15 @@ export class SampleSource {
 /**
  * Drives a source through a plan and paints a canvas.
  *
- * Cuts: the standby decoder is primed a second ahead, the sound is faded out
- * just before the cut point, the picture switches decoders instantly and
- * dissolves from the last frame, and the sound fades back in.
+ * Sound: the recording's audio is decoded once and played from the Web Audio
+ * clock, one buffer source per stretch of the edit, with silenced commands
+ * written into its gain envelope. Cuts are therefore sample-accurate: video
+ * decoders resume a recorded WebM up to ~0.3s early on a seek, which used to
+ * let the end of a cut command slip through. (If decoding fails, the video
+ * elements' own sound is used, faded by the plan.)
+ *
+ * Pictures: the standby decoder is primed a second ahead, so a cut switches
+ * decoders instantly and the screen dissolves from the last frame.
  * Fast-forward: frames are blended into a short motion trail so 4× and 8×
  * look smooth rather than strobing.
  */
@@ -306,6 +314,10 @@ export class Player {
     this.fadeStart = 0;
     /** @type {number | undefined} */
     this.lastSrc = undefined;
+    /** @type {AudioBuffer | null} the decoded sound, once ready */
+    this.buffer = null;
+    /** @type {{node: AudioBufferSourceNode, g: GainNode, src0: number, src1: number, rate: number, when: number} | null} */
+    this.voice = null;
     this.raf = 0;
     this.loop = this.loop.bind(this);
     this.raf = requestAnimationFrame(this.loop);
@@ -314,9 +326,11 @@ export class Player {
       vs.onSwap = (/** @type {HTMLVideoElement} */ now, /** @type {HTMLVideoElement} */ old) => {
         const t = this.actx?.currentTime ?? 0;
         this.elemGains.get(old)?.gain.setTargetAtTime(0, t, 0.01);
-        this.elemGains.get(now)?.gain.setTargetAtTime(1, t, 0.01);
+        this.elemGains.get(now)?.gain.setTargetAtTime(this.buffer ? 0 : 1, t, 0.01);
       };
     }
+    // Start decoding the sound straight away, so it's ready by the first play.
+    if (source.blob) this.audio();
   }
 
   /** Route the video's sound through Web Audio (needed for export, fades and fast-forward muting). */
@@ -336,7 +350,119 @@ export class Player {
     this.gain.connect(this.actx.destination);
     this.dest = this.actx.createMediaStreamDestination();
     this.gain.connect(this.dest);
+    const blob = this.source.blob;
+    if (blob) {
+      const actx = this.actx;
+      blob
+        .arrayBuffer()
+        .then((ab) => actx.decodeAudioData(ab))
+        .then((buf) => {
+          if (!buf || buf.duration < 0.3) return;
+          this.buffer = buf;
+          // From now on the elements are silent; the buffer carries the sound.
+          for (const g of this.elemGains.values()) g.gain.setValueAtTime(0, actx.currentTime);
+          this.gain?.gain.setValueAtTime(1, actx.currentTime);
+          if (this.playing && !this.busy) this.startVoice(this.source.time());
+        })
+        .catch(() => {});
+    }
     return this.gain;
+  }
+
+  /**
+   * The stretch of the edit around src that plays as one continuous sound:
+   * contiguous segments at the same audible speed.
+   * @param {number} src
+   */
+  run(src) {
+    const segs = this.getPlan().segments;
+    const i = segs.findIndex((g) => src >= g.src0 - 0.001 && src < g.src1);
+    if (i < 0 || segs[i].rate > AUDIBLE_RATE) return null;
+    const rate = segs[i].rate;
+    let a = i, b = i;
+    while (a > 0 && segs[a - 1].rate === rate && Math.abs(segs[a - 1].src1 - segs[a].src0) < 0.002) a--;
+    while (b + 1 < segs.length && segs[b + 1].rate === rate && Math.abs(segs[b].src1 - segs[b + 1].src0) < 0.002) b++;
+    return { src0: segs[a].src0, src1: segs[b].src1, rate };
+  }
+
+  /** Play the decoded sound from src to the end of its stretch, on the audio clock. @param {number} src */
+  startVoice(src) {
+    this.stopVoice();
+    const buf = this.buffer, actx = this.actx;
+    if (!buf || !actx || !this.gain || !this.playing) return;
+    const r = this.run(src);
+    if (!r) return;
+    const from = Math.max(src, r.src0), to = Math.min(r.src1, buf.duration);
+    if (to - from < 0.03) return;
+    const node = actx.createBufferSource();
+    node.buffer = buf;
+    node.playbackRate.value = r.rate;
+    const g = actx.createGain();
+    node.connect(g).connect(this.gain);
+    const when = actx.currentTime + 0.012;
+    const at = (/** @type {number} */ t) => when + (t - from) / r.rate;
+    const gp = g.gain;
+    // Fade in (8ms), then the silenced commands, then fade out at a cut.
+    const mutes = this.getPlan()
+      .mutes.filter((m) => m.src1 > from && m.src0 < to)
+      .sort((x, y) => x.src0 - y.src0);
+    const startsMuted = mutes.length && mutes[0].src0 <= from;
+    gp.setValueAtTime(0, when);
+    if (!startsMuted) gp.linearRampToValueAtTime(1, when + 0.008);
+    let last = when + 0.008;
+    for (const m of mutes) {
+      const a = Math.max(at(Math.max(m.src0, from)), last), b = Math.max(at(Math.min(m.src1, to)), a);
+      if (m.src0 > from) {
+        gp.setValueAtTime(1, Math.max(last, a - 0.015));
+        gp.linearRampToValueAtTime(0, a);
+      }
+      gp.setValueAtTime(0, b);
+      if (m.src1 < to) gp.linearRampToValueAtTime(1, b + 0.02);
+      last = b + 0.02;
+    }
+    const end = at(to);
+    if (end - 0.012 > last) {
+      gp.setValueAtTime(1, end - 0.012);
+      gp.linearRampToValueAtTime(0, end);
+    }
+    node.start(when, from, to - from);
+    this.voice = { node, g, src0: from, src1: to, rate: r.rate, when };
+    node.onended = () => {
+      if (this.voice && this.voice.node === node) this.voice = null;
+    };
+  }
+
+  /** Stop the sound with a short fade. */
+  stopVoice() {
+    const v = this.voice;
+    if (!v || !this.actx) return;
+    this.voice = null;
+    const now = this.actx.currentTime;
+    try {
+      v.g.gain.cancelScheduledValues(now);
+      v.g.gain.setValueAtTime(v.g.gain.value, now);
+      v.g.gain.linearRampToValueAtTime(0, now + 0.008);
+      v.node.stop(now + 0.012);
+    } catch {
+      /* already stopped */
+    }
+  }
+
+  /**
+   * Keep the sound with the picture: start it when a new stretch begins, and
+   * restart it if the audio clock and the video have drifted apart.
+   * @param {number} src the video's own time
+   */
+  syncVoice(src) {
+    if (!this.buffer || !this.actx) return;
+    const r = this.run(src);
+    const v = this.voice;
+    if (!r) return v && this.stopVoice();
+    if (!v || src < v.src0 - 0.05 || src >= v.src1 - 0.005) return this.startVoice(src);
+    const now = this.actx.currentTime;
+    if (now < v.when + 0.25) return;
+    const heard = v.src0 + (now - v.when) * v.rate;
+    if (heard < v.src1 - 0.05 && Math.abs(heard - src) > 0.07) this.startVoice(src);
   }
 
   async play() {
@@ -350,10 +476,12 @@ export class Player {
     this.playing = true;
     this.clockAt = 0;
     await this.source.play(this.rate);
+    this.startVoice(this.source.time());
   }
 
   pause() {
     this.playing = false;
+    this.stopVoice();
     this.source.pause();
     this.source.camera?.sync(this.source.time(), false, this.rate);
   }
@@ -378,9 +506,11 @@ export class Player {
     const plan = this.getPlan();
     const at = outToSrc(plan.segments, Math.max(0, Math.min(o, plan.outDuration)));
     if (!at) return;
+    this.stopVoice();
     this.busy = true;
     await this.source.seek(at.src);
     this.busy = false;
+    if (this.playing) this.startVoice(at.src);
     this.clock = at.src;
     this.clockAt = 0;
     this.out = srcToOut(plan.segments, at.src, plan.outDuration);
@@ -443,6 +573,7 @@ export class Player {
         this.rate = seg.rate;
         this.source.setRate(this.rate);
       }
+      this.syncVoice(src);
       // Fade the sound for silenced commands, fast-forwards and cut edges.
       const g = this.wantGain(src);
       if (g !== this.lastGain) {
@@ -462,6 +593,7 @@ export class Player {
   /** Cut to where the next segment starts: switch decoders if one is ready, else seek. @param {import('./plan.js').Segment} seg */
   jumpTo(seg) {
     this.snapshot();
+    this.stopVoice();
     this.ramp(0, 0.012);
     this.lastGain = 0;
     const landed = () => {
@@ -474,6 +606,7 @@ export class Player {
       const g = this.wantGain(seg.src0 + 0.01);
       this.ramp(g, 0.04);
       this.lastGain = g;
+      this.startVoice(seg.src0);
     };
     if (this.source.canSwap?.(seg.src0) && this.source.swap) {
       this.source.swap(seg.rate);
@@ -500,7 +633,8 @@ export class Player {
 
   /** Smoothly move the volume, avoiding clicks. @param {number} to @param {number} tc */
   ramp(to, tc) {
-    if (!this.gain || !this.actx) return;
+    // With decoded sound the master stays open; each stretch has its own envelope.
+    if (!this.gain || !this.actx || this.buffer) return;
     const g = this.gain.gain;
     const now = this.actx.currentTime;
     g.cancelScheduledValues(now);
@@ -559,6 +693,7 @@ export class Player {
   destroy() {
     cancelAnimationFrame(this.raf);
     this.pause();
+    this.buffer = null;
     this.actx?.close();
   }
 }

@@ -2,7 +2,7 @@
 
 **A screen recorder you direct out loud.**
 
-Record your screen and talk as you normally would. Fumble a sentence? Say **"scratch that"** and it's gone. Something too small to read? Say **"zoom in"**. Pasted an API key on screen? Say **"hide that"** and it's blurred from the moment it appeared. Stop recording, and the video is already edited, captioned and split into chapters.
+**Edit out loud.** Record your screen and talk as you normally would. Fumble a sentence? Say **"scratch that"** and it's gone. Something too small to read? Say **"zoom in"**. Pasted an API key on screen? Say **"hide that"** and it's blurred from the moment it appeared. Stop recording, and the video is already edited, captioned and split into chapters.
 
 No timeline. No editing session. No upload: everything happens in your browser.
 
@@ -47,7 +47,7 @@ And without being asked:
 - **YouTube chapters** are generated, with a warning if they don't meet YouTube's rules.
 - **Live slate with your camera:** a 3-2-1 countdown (Retake is already listening, so "big camera" works from the first word), then a slate showing your camera preview, a timer, a mic level, what Retake heard, each command as it lands, and a pause button.
 - **Float my camera:** pops just your camera bubble out above every other window, so you can see yourself while you work. If you're recording the whole screen, Retake remembers where you dragged it and the bubble in the video follows.
-- **A final cut that doesn't feel cut.** Phrase timing from speech recognition is re-measured against the mic's loudness, so cuts land in real silences. The sound fades out just *before* a silenced command or a cut, so not even the first syllable gets through. Cuts switch between two pre-seeked video decoders instead of seeking, so they're instant; only the screen dissolves, and your camera bubble glides straight through. Spoken commands are **silenced, not cut**, when something is happening on screen (so a zoom or a camera change isn't chopped out), and cut when the screen is still. You can choose Smart, Silence or Cut in Style. Every cut dissolves over 450ms with an eased audio ramp, and camera changes start as you say them.
+- **A final cut that doesn't feel cut.** Phrase timing from speech recognition is re-measured against the mic's loudness, so cuts land in real silences. The recording's sound is decoded once and played from the Web Audio clock, so every cut and every silenced command lands on the exact sample (video decoders resume a browser-recorded WebM up to 0.3s early after a seek, which used to let the end of a command slip through). Pictures switch between two pre-seeked video decoders, so cuts are instant; only the screen dissolves, and your camera bubble glides straight through. Spoken commands are **silenced, not cut**, when something is happening on screen (so a zoom or a camera change isn't chopped out), and cut when the screen is still. You can choose Smart, Silence or Cut in Style. Every cut dissolves over 450ms with an eased audio ramp, and camera changes start as you say them.
 - **Three versions of every take:** **Final** (what viewers get), **Demo** (your spoken commands stay in, each labelled with what Retake did, and the parts that would be cut play fast under a red overlay, which is ideal for showing Retake off) and **Raw**. Any of them can be exported.
 - **Nothing is final:** every direction appears in the Director's notes with a switch to undo it, and a **Raw take** toggle shows the original for comparison.
 - **Private:** recording, speech recognition (Chrome's built-in), analysis and rendering all run in the browser. The last take is kept in this browser so a refresh doesn't lose it.
@@ -89,7 +89,9 @@ flowchart LR
 1. A voice-activity mask from the mic (hysteresis, so soft consonants at word edges count; 160ms gaps between words bridged; clicks dropped) finds where speech really starts and stops.
 2. Each phrase is snapped to that voice.
 3. Each word is placed inside its phrase by spreading its syllables over the voiced frames, with word boundaries snapped to the pauses inside the phrase (a light forced alignment).
-4. Cuts, silenced commands and captions are all cut from those word times, so "...and that's it, zoom in" silences exactly "zoom in".
+4. A phrase's end is found by walking *forward* through the voice to the pause where its syllables have been said and the next phrase begins, because the recogniser often finalises a phrase after you've started the next sentence.
+5. A command inside a longer phrase is located as the stretch of voice between two pauses whose length fits the command, and the words on either side are re-timed around it. So "scratch that, first we open the settings" cuts the fumble and keeps the retake, and "...and that's it, zoom in" silences exactly "zoom in".
+6. Recognition often runs a command into the next sentence ("back to the screen so here we have…"). Camera commands at the start or end of a phrase still count, but only if the recording shows a pause between them and the rest, so "we bought a big camera" never triggers anything.
 
 **Smoothness.** Zooms glide over 1.1s of *output* time with a quintic ease and logarithmic scale (equal steps feel equally fast, as with a real lens), and a new glide starts from wherever the last one got to, so a quick "zoom in … zoom out" never jumps. Fast-forwards ramp up and down through intermediate speeds (still exact source↔output time mapping), drop back to normal speed whenever you talk, and blend a motion trail at 4× and 8×. In the Demo version, a fumble that will be cut plays at 1.25× with its sound, so viewers hear the mistake and the command that removed it.
 
@@ -115,7 +117,7 @@ The plan is rebuilt from scratch whenever you flip a switch or change a setting,
 npm test
 ```
 
-38 tests on the command parser, motion analysis and planner, including:
+44 tests on the command parser, motion analysis and planner, including:
 
 - every direction in English, Hinglish and Devanagari Hindi;
 - ordinary narration ("this hides the sidebar", "the cut off date") is not mistaken for a direction;
@@ -129,10 +131,13 @@ npm test
 - Spanish, French, German, Portuguese and Italian; "pause" however the recogniser spells it, and only where the recording really paused;
 - words land where the voice is; captions follow the words and never overlap; the sound is already off when a silenced command starts;
 - fast-forward ramps keep time mapping exact and never speed up narration; zoom glides never jump; the Demo version never skips speech;
+- real recogniser timing: a late final result never drags a command into the next sentence; "scratch that" works however the words are grouped, and the retake survives; camera commands run into a sentence work only with a pause; the product's name in a sentence isn't a command;
 - switching a direction off restores the footage;
 - source↔output time mapping round-trips exactly; SRT and YouTube chapter output;
 - camera directions build a timeline with smooth transitions, and are ignored inside ordinary sentences ("we bought a big camera");
 - the Demo version keeps commands audible, plays would-be cuts fast, and still reports the final cut's numbers.
+
+**End-to-end leak test.** A narrated take is synthesised with speech synthesis, with a faint 3150 Hz marker tone mixed into the command words only, and fed to Chromium as its microphone. A stand-in for the speech recogniser delivers phrases the way Chrome does (interim results 0.5s in, final results 1.3s after you stop, often merged with the next sentence). The take is recorded, planned and exported, and the exported audio is scanned for the marker: the raw export shows every command; the final export shows none, in both Smart and Cut modes.
 
 The full app was also driven end to end in headless Chromium: the sample take, every effect rendered, undo, Raw/Retake comparison, a complete real-time export (checked with ffprobe), and a real recording using simulated screen, microphone and camera devices.
 
