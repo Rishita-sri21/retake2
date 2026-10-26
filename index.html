@@ -4,20 +4,20 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>Retake</title>
-  <meta name="description" content="A screen recorder you direct out loud. Say “scratch that”, “zoom here” or “hide that” while you record, and get a finished, captioned video with no editing.">
-  <meta name="theme-color" content="#12141c">
+  <meta name="description" content="A screen recorder you direct out loud. Say “scratch that”, “zoom in” or “hide that” while you record, and get a finished, captioned video with no editing.">
+  <meta name="theme-color" content="#0e0e10">
   <link rel="icon" href="assets/icon.svg" type="image/svg+xml">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fredoka:wght@500;600;700&family=Nunito:wght@400;500;600;700;800&family=DM+Mono:wght@500&display=swap">
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Instrument+Sans:ital,wght@0,400..700;1,400..700&family=Geist+Mono:wght@400;500&display=swap">
   <link rel="stylesheet" href="styles.css">
   <script type="module" src="src/app.js"></script>
 </head>
 <body>
   <header class="topbar">
     <a class="brand" href="./" aria-label="Retake home">
-      <svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true"><rect x="2" y="2" width="28" height="28" rx="9" fill="#ffc861"/><circle cx="16" cy="16" r="6.5" fill="#12141c"/><circle cx="16" cy="16" r="2.6" fill="#ff7b86"/></svg>
-      <span class="brand-name">retake</span>
+      <svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true"><circle cx="16" cy="16" r="14.5" fill="none" stroke="#e8c9a0" stroke-width="1.5"/><circle cx="16" cy="16" r="5" fill="#e5534b"/></svg>
+      <span class="brand-name">Retake</span>
     </a>
     <span class="topbar-note">Edit by voice, while you record</span>
   </header>
@@ -27,8 +27,8 @@
     <section id="home" class="screen">
       <div class="hero">
         <p class="eyebrow">A screen recorder you direct out loud</p>
-        <h1>Say <span class="said">“scratch that”</span> and it’s gone.</h1>
-        <p class="lede">Record your screen and talk as you normally would. Fumbled a sentence? Say <b>“scratch that”</b>. Text too small? <b>“Zoom here.”</b> Pasted an API key on screen? <b>“Hide that.”</b> When you stop, the video is already edited, captioned and split into chapters.</p>
+        <h1>Say <em>“scratch that”</em><br>and it’s gone.</h1>
+        <p class="lede">Record your screen and talk as you normally would. Fumbled a sentence? Say <b>“scratch that”</b>. Text too small? <b>“Zoom in.”</b> Pasted an API key on screen? <b>“Hide that.”</b> When you stop, the video is already edited, captioned and split into chapters.</p>
         <div class="hero-actions">
           <button class="btn primary" id="record" type="button"><span class="dot" aria-hidden="true"></span>Start recording</button>
           <button class="btn soft" id="try-sample" type="button">Try the sample take</button>
@@ -56,7 +56,7 @@
           <h2 id="vocab-title">What you can say</h2>
           <p>Say these while you record. Everything else you say becomes captions.</p>
         </div>
-        <ul class="vocab-grid" id="vocab"></ul>
+        <div class="vocab-groups" id="vocab"></div>
         <div class="auto">
           <h3>And without being asked</h3>
           <ul>
@@ -79,7 +79,7 @@
       </div>
       <div class="hud" id="hud">
         <div class="hud-top">
-          <span class="rec-pill"><span class="dot live" aria-hidden="true"></span>Recording</span>
+          <span class="rec-pill"><span class="dot live" aria-hidden="true"></span><span id="rec-label">Recording</span></span>
           <span class="hud-time" id="hud-time">00:00</span>
         </div>
         <div class="hud-body">
@@ -93,9 +93,10 @@
         <ol class="hud-log" id="hud-log"></ol>
         <div class="hud-actions">
           <button class="btn primary" id="stop" type="button"><span class="square" aria-hidden="true"></span>Stop and edit</button>
-          <button class="btn soft small" id="pop-out" type="button">Float this window</button>
+          <button class="btn soft" id="pause" type="button">Pause</button>
+          <button class="btn soft" id="pop-out" type="button">Float my camera</button>
         </div>
-        <p class="hud-tip">Tip: record a window or a tab rather than your whole screen, so this preview isn’t in your video.</p>
+        <p class="hud-tip">Say <b>“pause”</b>, <b>“resume”</b> or <b>“stop recording”</b> any time. <b>Float my camera</b> puts just your bubble above every window; drag it anywhere. If you’re sharing your whole screen, the bubble in the final video follows it.</p>
       </div>
     </section>
 
@@ -142,7 +143,8 @@
               <li><i class="k zoom"></i>Zoom</li>
               <li><i class="k blur"></i>Hidden</li>
               <li><i class="k spot"></i>Spotlight</li>
-              <li><i class="k cam"></i>Camera</li>
+              <li><i class="k cam"></i>Big camera</li>
+              <li><i class="k mute"></i>Silenced</li>
               <li><i class="k chap"></i>Chapter</li>
             </ul>
           </div>
@@ -164,6 +166,13 @@
           <div class="panel" id="panel-look" role="tabpanel" hidden>
             <div class="group">
               <h3>Edit</h3>
+              <div class="row"><span>Spoken commands</span>
+                <div class="seg" id="cmd-style" role="radiogroup" aria-label="How spoken commands leave the final video">
+                  <button type="button" role="radio" data-style="smart" aria-checked="true">Smart</button>
+                  <button type="button" role="radio" data-style="mute" aria-checked="false">Silence</button>
+                  <button type="button" role="radio" data-style="cut" aria-checked="false">Cut</button>
+                </div></div>
+              <p class="small-print">Smart silences a command while the screen is moving, so the picture never jumps, and cuts it where nothing moves.</p>
               <label class="row"><span>Trim dead air</span><span class="toggle bare"><input type="checkbox" id="opt-dead" checked><span class="track"></span></span></label>
               <label class="row"><span>Fast-forward speed</span>
                 <select id="opt-speed"><option value="2">2×</option><option value="4" selected>4×</option><option value="8">8×</option></select></label>
@@ -181,7 +190,7 @@
               <h3>Camera bubble</h3>
               <label class="row"><span>Show camera</span><span class="toggle bare"><input type="checkbox" id="opt-cam" checked><span class="track"></span></span></label>
               <div class="row"><span>Shape</span>
-                <div class="seg" role="radiogroup" aria-label="Bubble shape">
+                <div class="seg" id="cam-shape" role="radiogroup" aria-label="Bubble shape">
                   <button type="button" role="radio" data-shape="circle" aria-checked="true">Circle</button>
                   <button type="button" role="radio" data-shape="rounded" aria-checked="false">Rounded</button>
                 </div></div>
@@ -193,6 +202,7 @@
                   <button type="button" data-corner="br" aria-label="Bottom right" aria-pressed="true"></button>
                 </div></div>
               <label class="row"><span>Size</span><input type="range" id="opt-camsize" min="14" max="38" value="26"></label>
+              <label class="row" id="follow-row"><span>Follow where I moved it while recording</span><span class="toggle bare"><input type="checkbox" id="opt-follow" checked><span class="track"></span></span></label>
               <p class="small-print">Drag the bubble on the preview to put it anywhere. Say “big camera” to fill the frame with your face, and “back to the screen” to send it back.</p>
             </div>
           </div>

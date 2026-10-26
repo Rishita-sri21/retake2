@@ -5,7 +5,7 @@ import { Recorder, canRecord, canTranscribe } from './recorder.js';
 import { Player, VideoSource, SampleSource, CameraTrack, exportVideo, exportFormat } from './player.js';
 import { buildSampleTake } from './sample.js';
 import { saveTake, loadTake, prefs } from './store.js';
-import { DEFAULT_LOOK, camRect } from './render.js';
+import { DEFAULT_LOOK, camRect, pathCenter } from './render.js';
 import { icon, iconEl } from './icons.js';
 
 /** @typedef {import('./plan.js').Plan} Plan */
@@ -22,13 +22,18 @@ const COLORS = {
   cut: 'var(--cut)', hide: 'var(--blur)', zoomIn: 'var(--zoom)', zoomOut: 'var(--zoom)', highlight: 'var(--spot)',
   speedUp: 'var(--speed)', normalSpeed: 'var(--speed)', chapter: 'var(--text)', title: 'var(--text)', mark: 'var(--muted)',
   camBig: 'var(--cam)', camSmall: 'var(--cam)', camHide: 'var(--cam)', camShow: 'var(--cam)',
+  cutSentences: 'var(--cut)', cutSeconds: 'var(--cut)', cutFrom: 'var(--cut)', cutTo: 'var(--cut)',
+  unhide: 'var(--blur)', hideScreen: 'var(--blur)', showScreen: 'var(--blur)',
+  pause: 'var(--rec)', resume: 'var(--rec)', stop: 'var(--rec)',
 };
 
 const HINDI = {
   cut: 'kaat do · काट दो', hide: 'chhupa do · छुपा दो', zoomIn: 'zoom karo · ज़ूम करो', zoomOut: 'zoom out karo',
   highlight: 'yahan dekho · यहाँ देखो', speedUp: 'tez karo · तेज़ करो', normalSpeed: 'normal karo', chapter: 'अध्याय: …',
   title: 'टाइटल: …', mark: '', camBig: 'camera bada karo', camSmall: 'camera chhota karo', camHide: 'camera band karo',
-  camShow: 'camera chalu karo',
+  camShow: 'camera chalu karo', cutFrom: 'yahan se kaato', cutTo: 'yahan tak kaato', hideScreen: 'screen chhupa do',
+  showScreen: 'screen dikhao', pause: 'ruko · रुको', resume: 'chalu karo', stop: 'recording band karo',
+  cutSentences: '', cutSeconds: '', unhide: 'ab dikhao',
 };
 
 const DOES = {
@@ -46,6 +51,26 @@ const DOES = {
   camSmall: 'Sends your bubble back to its spot. “Back to the screen” works too.',
   camHide: 'Tucks your bubble away when it covers something.',
   camShow: 'Brings your bubble back.',
+  cutSentences: 'Removes the sentences you just said. “Cut the last sentence” works too.',
+  cutSeconds: 'Removes exactly that many seconds before you said it.',
+  cutFrom: 'Marks where a cut begins. Do the messy part, then say “cut till here”.',
+  cutTo: 'Marks where the cut ends.',
+  unhide: 'Ends a “hide that” early. Or say “hide that for ten seconds”.',
+  hideScreen: 'Blurs the entire screen, e.g. while you open your email.',
+  showScreen: 'Shows the screen again.',
+  pause: 'Pauses the recording. Nothing is recorded until you say “resume”.',
+  resume: 'Picks the recording up again, with a soft dissolve at the join.',
+  stop: 'Ends the recording and opens the editor.',
+};
+
+const GROUPS = {
+  Cut: 'Cut mistakes',
+  Hide: 'Keep things private',
+  Zoom: 'Direct the viewer’s eye',
+  Time: 'Control time',
+  Recording: 'Control the recording',
+  Structure: 'Give it structure',
+  You: 'Your camera bubble',
 };
 
 // ---------------------------------------------------------------- state
@@ -77,6 +102,7 @@ function options() {
     zoom: Number(/** @type {HTMLSelectElement} */ ($('opt-zoom')).value),
     levelThreshold: state.take?.levelThreshold ?? DEFAULTS.levelThreshold,
     disabled: state.disabled,
+    commandStyle: /** @type {'smart'|'cut'|'mute'} */ (/** @type {HTMLElement} */ (document.querySelector('#cmd-style [aria-checked="true"]'))?.dataset.style || 'smart'),
   };
 }
 
@@ -129,26 +155,38 @@ function badge(type, cls) {
 // ---------------------------------------------------------------- home
 
 function renderVocab() {
+  /** @type {Record<string, typeof GRAMMAR>} */
+  const by = {};
+  for (const g of GRAMMAR) (by[g.group] ||= []).push(g);
   $('vocab').replaceChildren(
-    ...GRAMMAR.map((g) => {
-      const li = document.createElement('li');
-      li.className = 'cmd-card';
-      li.style.setProperty('--c', COLORS[g.type]);
-      const ic = badge(g.type, 'cmd-icon');
-      const say = document.createElement('span');
-      say.className = 'say';
-      say.textContent = `“${g.say}”`;
-      const does = document.createElement('span');
-      does.className = 'does';
-      does.textContent = DOES[g.type];
-      li.append(ic, say, does);
-      if (HINDI[g.type]) {
-        const alias = document.createElement('span');
-        alias.className = 'alias';
-        alias.textContent = `Also: ${HINDI[g.type]}`;
-        li.append(alias);
+    ...Object.entries(by).map(([group, list]) => {
+      const sec = document.createElement('section');
+      sec.className = 'vocab-group';
+      const h = document.createElement('h3');
+      h.textContent = GROUPS[/** @type {keyof typeof GROUPS} */ (group)] || group;
+      const ul = document.createElement('ul');
+      ul.className = 'vocab-grid';
+      for (const g of list) {
+        const li = document.createElement('li');
+        li.className = 'cmd-card';
+        li.style.setProperty('--c', COLORS[g.type]);
+        const say = document.createElement('span');
+        say.className = 'say';
+        say.textContent = `“${g.say}”`;
+        const does = document.createElement('span');
+        does.className = 'does';
+        does.textContent = DOES[g.type];
+        li.append(badge(g.type, 'cmd-icon'), say, does);
+        if (HINDI[g.type]) {
+          const alias = document.createElement('span');
+          alias.className = 'alias';
+          alias.textContent = `Also: ${HINDI[g.type]}`;
+          li.append(alias);
+        }
+        ul.append(li);
       }
-      return li;
+      sec.append(h, ul);
+      return sec;
     }),
   );
 }
@@ -182,6 +220,8 @@ async function startRecording() {
     onLevel: (v) => ($('hud-level').style.width = `${Math.min(100, v * 600)}%`),
     onEnded: () => stopRecording(),
     onWarn: (m) => toast(m),
+    onPauseChange: (paused) => setPausedUi(paused),
+    onStopRequested: () => stopRecording(),
   });
   try {
     await recorder.prepare({ lang, systemAudio: input('system-audio').checked, camera: input('camera').checked });
@@ -248,6 +288,7 @@ async function stopRecording() {
   recorder = null;
   clearInterval(hudTimer);
   closePip();
+  setPausedUi(false);
   $('hud-heard').textContent = 'Putting your take together…';
   const take = await r.stop();
   /** @type {HTMLVideoElement} */ ($('hud-cam')).srcObject = null;
@@ -261,27 +302,67 @@ async function stopRecording() {
   await openTake(take);
 }
 
-async function popOut() {
+/** @param {boolean} paused */
+function setPausedUi(paused) {
+  $('rec-label').textContent = paused ? 'Paused · say “resume”' : 'Recording';
+  $('hud').classList.toggle('is-paused', paused);
+  $('pause').replaceChildren(iconEl(paused ? 'resume' : 'pause'), paused ? 'Resume' : 'Pause');
+}
+
+/** @type {ReturnType<typeof setInterval> | undefined} */
+let pathTimer;
+
+/**
+ * Float just your camera bubble above everything, so you can see yourself and
+ * drag the bubble wherever it's out of the way. When the whole screen is
+ * being recorded, the bubble's position is tracked and the final video's
+ * bubble follows it.
+ */
+async function floatCamera() {
   const dpip = /** @type {any} */ (window).documentPictureInPicture;
   if (!dpip) {
-    toast('A floating window needs Chrome or Edge 116+.');
+    toast('Floating the bubble needs Chrome or Edge 116+.');
     return;
   }
-  pip = await dpip.requestWindow({ width: 380, height: 480 });
+  if (!recorder?.camStream) {
+    toast('Turn on “Show me in a bubble” before recording to float your camera.');
+    return;
+  }
+  pip = await dpip.requestWindow({ width: 220, height: 220 });
   const doc = /** @type {Window} */ (pip).document;
-  doc.documentElement.classList.add('pip');
+  doc.documentElement.classList.add('pip-bubble');
   for (const link of document.querySelectorAll('link[rel="stylesheet"]')) doc.head.append(link.cloneNode());
-  doc.body.append($('hud'));
-  /** @type {HTMLVideoElement} */ ($('hud-cam')).play?.().catch(() => {});
-  /** @type {Window} */ (pip).addEventListener('pagehide', () => {
-    $('rec').append($('hud'));
+  const v = doc.createElement('video');
+  v.className = 'bubble-video';
+  v.muted = true;
+  v.playsInline = true;
+  v.autoplay = true;
+  v.srcObject = recorder.camStream;
+  doc.body.append(v);
+  v.play().catch(() => {});
+  const w = /** @type {Window} */ (pip);
+  if (recorder.surface === 'monitor') {
+    const r = recorder;
+    const sample = () => {
+      if (!r.running || r.paused) return;
+      const scr = /** @type {any} */ (window.screen);
+      const left = scr.availLeft ?? 0, topEdge = scr.availTop ?? 0;
+      const x = (w.screenX - left + w.outerWidth / 2) / scr.width;
+      const y = (w.screenY - topEdge + w.outerHeight / 2) / scr.height;
+      if (Number.isFinite(x) && Number.isFinite(y)) r.camPath.push({ t: r.now(), x: Math.max(0, Math.min(1, x)), y: Math.max(0, Math.min(1, y)) });
+    };
+    sample();
+    pathTimer = setInterval(sample, 250);
+  }
+  w.addEventListener('pagehide', () => {
+    clearInterval(pathTimer);
     pip = null;
   });
 }
 
 function closePip() {
+  clearInterval(pathTimer);
   if (pip) {
-    $('rec').append($('hud'));
     pip.close();
     pip = null;
   }
@@ -347,6 +428,7 @@ async function openTake(take) {
   warn.textContent = 'Retake didn’t hear any words in this take, so there were no commands to follow. Check that your microphone is on and you’re using Chrome or Edge.';
 
   $('cam-opts').hidden = !source.camera;
+  $('follow-row').hidden = !(take.camPath && take.camPath.length > 1);
   $('drag-hint').hidden = !source.camera;
   setTimeout(() => ($('drag-hint').hidden = true), 7000);
   renderFilm();
@@ -367,6 +449,7 @@ function renderEditor() {
   if (s.hidden) chips.push(['var(--blur)', `${s.hidden} secret${s.hidden > 1 ? 's' : ''} hidden`]);
   if (s.zooms) chips.push(['var(--zoom)', `${s.zooms} zoom${s.zooms > 1 ? 's' : ''}`]);
   if (s.chapters) chips.push(['var(--text)', `${s.chapters} chapter${s.chapters > 1 ? 's' : ''}`]);
+  if (s.muted) chips.push(['var(--faint)', `${s.muted} command${s.muted > 1 ? 's' : ''} silenced, picture kept`]);
   chips.push(['var(--faint)', `${fmt(plan.duration)} → ${fmt(plan.finalDuration)}`]);
   $('chips').replaceChildren(
     ...chips.map(([color, text]) => {
@@ -420,8 +503,9 @@ function renderBands() {
     if (plan.camera[i].mode === 'big') camBig.push(band('cam', plan.camera[i].src, plan.camera[i + 1]?.src ?? D, 'Big camera'));
   }
   $('bands').replaceChildren(
-    ...plan.cuts.map((c) => band(c.reason === 'dead-air' ? 'air' : 'cut', c.src0, c.src1, c.reason === 'dead-air' ? 'Dead air trimmed' : c.reason === 'fumble' ? 'Fumble cut' : 'Spoken command removed')),
+    ...plan.cuts.map((c) => band(c.reason === 'dead-air' ? 'air' : 'cut', c.src0, c.src1, c.reason === 'dead-air' ? 'Dead air trimmed' : c.reason === 'command' ? 'Spoken command removed' : c.reason === 'stop' ? 'After “stop recording”' : 'Cut')),
     ...plan.speeds.map((s) => band('speed', s.src0, s.src1, `Fast-forward ${s.rate}×`)),
+    ...plan.mutes.map((m) => band('mute', m.src0, m.src1, 'Spoken command silenced')),
     ...plan.zooms.map((z) => band('zoom', z.src0, z.src1, `Zoom ${z.scale}×`)),
     ...plan.blurs.map((b) => band('blur', b.src0, b.src1, 'Hidden')),
     ...plan.spots.map((s) => band('spot', s.src0, s.src1, 'Spotlight')),
@@ -537,7 +621,7 @@ function jumpToSource(t) {
 function setPlaying(on) {
   $('big-play').hidden = on;
   $('big-play').innerHTML = icon('play');
-  $('play').innerHTML = icon(on ? 'pause' : 'play');
+  $('play').innerHTML = icon(on ? 'pausebtn' : 'play');
   $('play').setAttribute('aria-label', on ? 'Pause' : 'Play');
 }
 
@@ -596,7 +680,7 @@ function bubbleAt(/** @type {number} */ x, /** @type {number} */ y) {
   const canvas = p.canvas;
   const mode = cameraModeAt(currentPlan(), p.source.time()).to;
   if (mode !== 'small') return null;
-  const r = camRect('small', canvas.width, canvas.height, state.look);
+  const r = camRect('small', canvas.width, canvas.height, state.look, pathCenter(currentPlan(), p.source.time(), state.look));
   const cx = r.x + r.d / 2, cy = r.y + r.d / 2;
   return Math.hypot(x - cx, y - cy) <= r.d / 2 ? { cx, cy } : null;
 }
@@ -710,7 +794,7 @@ function selectTab(name) {
 }
 
 function lookChanged() {
-  const shape = /** @type {HTMLElement} */ (document.querySelector('.seg [aria-checked="true"]'))?.dataset.shape;
+  const shape = /** @type {HTMLElement} */ (document.querySelector('#cam-shape [aria-checked="true"]'))?.dataset.shape;
   state.look = {
     ...state.look,
     captions: input('opt-captions').checked,
@@ -720,6 +804,7 @@ function lookChanged() {
     camera: input('opt-cam').checked,
     camShape: shape === 'rounded' ? 'rounded' : 'circle',
     camSize: Number(input('opt-camsize').value) / 100,
+    followPath: input('opt-follow').checked,
   };
   state.player?.paint();
 }
@@ -737,7 +822,8 @@ async function init() {
 
   $('record').addEventListener('click', startRecording);
   $('stop').addEventListener('click', stopRecording);
-  $('pop-out').addEventListener('click', popOut);
+  $('pop-out').addEventListener('click', floatCamera);
+  $('pause').addEventListener('click', () => (recorder?.paused ? recorder.resume() : recorder?.pause()));
   $('count-cancel').addEventListener('click', cancelCountdown);
   $('try-sample').addEventListener('click', async () => {
     $('try-sample').textContent = 'Loading…';
@@ -772,14 +858,20 @@ async function init() {
   for (const t of ['notes', 'look', 'words', 'export']) $(`tab-${t}`).addEventListener('click', () => selectTab(t));
 
   for (const id of ['opt-dead', 'opt-speed', 'opt-zoom']) $(id).addEventListener('change', rebuild);
-  for (const id of ['opt-captions', 'opt-capsize', 'opt-badge', 'opt-mark', 'opt-cam', 'opt-camsize']) {
+  for (const id of ['opt-captions', 'opt-capsize', 'opt-badge', 'opt-mark', 'opt-cam', 'opt-camsize', 'opt-follow']) {
     $(id).addEventListener('input', lookChanged);
     $(id).addEventListener('change', lookChanged);
   }
-  for (const b of document.querySelectorAll('.seg button')) {
+  for (const b of document.querySelectorAll('#cam-shape button')) {
     b.addEventListener('click', () => {
-      for (const o of document.querySelectorAll('.seg button')) o.setAttribute('aria-checked', String(o === b));
+      for (const o of document.querySelectorAll('#cam-shape button')) o.setAttribute('aria-checked', String(o === b));
       lookChanged();
+    });
+  }
+  for (const b of document.querySelectorAll('#cmd-style button')) {
+    b.addEventListener('click', () => {
+      for (const o of document.querySelectorAll('#cmd-style button')) o.setAttribute('aria-checked', String(o === b));
+      rebuild();
     });
   }
   for (const b of document.querySelectorAll('.corners button')) {

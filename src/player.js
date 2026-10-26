@@ -4,7 +4,7 @@
  * at speed, and draws every frame with the renderer. The export is the same
  * loop running onto a recorded canvas.
  */
-import { segmentAt, srcToOut, outToSrc } from './plan.js';
+import { segmentAt, srcToOut, outToSrc, mutedAt } from './plan.js';
 import { drawFrame } from './render.js';
 import { drawSample, drawPresenter, SAMPLE_W, SAMPLE_H, SAMPLE_DURATION } from './sample.js';
 
@@ -267,12 +267,18 @@ export class Player {
 
   applyRate() {
     this.source.setRate(this.rate);
-    this.ramp(this.rate > 1 ? 0 : 1, 0.03);
+    this.ramp(this.wantGain(this.source.time()), 0.03);
+  }
+
+  /** Volume for this moment: silent while fast-forwarding or during a spoken command. @param {number} src */
+  wantGain(src) {
+    return this.rate > 1 || mutedAt(this.getPlan(), src) ? 0 : 1;
   }
 
   /** @param {number} o */
   async seekOut(o) {
     this.fadeStart = 0;
+    this.lastSrc = undefined;
     const plan = this.getPlan();
     const at = outToSrc(plan.segments, Math.max(0, Math.min(o, plan.outDuration)));
     if (!at) return;
@@ -319,7 +325,9 @@ export class Player {
         this.source.seek(seg.src0).then(() => {
           this.busy = false;
           this.fadeStart = performance.now();
-          this.ramp(this.rate > 1 ? 0 : 1, 0.04);
+          this.lastSrc = seg.src0;
+          this.lastGain = this.wantGain(seg.src0);
+          this.ramp(this.lastGain, 0.05);
           this.onJump?.(false);
         });
         return;
@@ -328,6 +336,16 @@ export class Player {
         this.rate = seg.rate;
         this.applyRate();
       }
+      // Silence spoken commands with a soft fade rather than a hard gap.
+      const g = this.wantGain(src);
+      if (g !== this.lastGain) {
+        this.ramp(g, 0.05);
+        this.lastGain = g;
+      }
+      // A pause in the recording is a join in the footage: dissolve across it.
+      const last = this.lastSrc ?? src;
+      if (plan.joins.some((j) => last < j && src >= j)) this.snapshot(), (this.fadeStart = performance.now());
+      this.lastSrc = src;
       this.out = srcToOut(plan.segments, src, plan.outDuration);
       this.onTime(this.out);
     }
@@ -359,10 +377,11 @@ export class Player {
     drawFrame(this.ctx, this.canvas.width, this.canvas.height, this.source, plan, src, this.out, this.rate, this.getLook(), cam);
     // Crossfade from the frame before the cut.
     if (this.fadeStart && this.fadeCanvas) {
-      const a = 1 - (performance.now() - this.fadeStart) / 320;
+      const k = (performance.now() - this.fadeStart) / 450;
+      const a = 1 - k;
       if (a > 0) {
         this.ctx.save();
-        this.ctx.globalAlpha = a * a;
+        this.ctx.globalAlpha = 1 - (1 - Math.pow(1 - k, 3)); // ease-out dissolve
         this.ctx.drawImage(this.fadeCanvas, 0, 0);
         this.ctx.restore();
       } else this.fadeStart = 0;

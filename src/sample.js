@@ -31,7 +31,7 @@ export const SAMPLE_PHRASES = [
   { text: 'Then we fetch the forecast and draw the uh, the graph thing', start: 42.0, end: 46.0 },
   { text: 'scratch that', start: 46.5, end: 47.5 },
   { text: 'Then we fetch the forecast and draw it as a chart', start: 48.0, end: 52.0 },
-  { text: 'zoom here', start: 52.6, end: 53.6 },
+  { text: 'zoom in on the right', start: 52.4, end: 53.6 },
   { text: 'The chart updates live when you switch cities', start: 54.0, end: 59.0 },
   { text: 'zoom out', start: 59.6, end: 60.6 },
   { text: "And it's deployed at this address", start: 61.0, end: 63.6 },
@@ -59,8 +59,8 @@ const C = {
   bar2: '#9bb3ff',
 };
 
-const MONO = '"DM Mono", ui-monospace, Menlo, Consolas, monospace';
-const SANS = '"Nunito", system-ui, sans-serif';
+const MONO = '"Geist Mono", ui-monospace, Menlo, Consolas, monospace';
+const SANS = '"Instrument Sans", system-ui, sans-serif';
 
 /** Characters of `s` typed between t0 and t1. @param {string} s @param {number} t @param {number} t0 @param {number} t1 */
 function typed(s, t, t0, t1) {

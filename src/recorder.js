@@ -29,6 +29,8 @@ import { parseCommands } from './commands.js';
  * @property {Blob | null} camBlob     Webcam recording, if the camera was on.
  * @property {number} camOffset        Seconds the camera started after the screen.
  * @property {boolean} hasCamera
+ * @property {number[]} joins
+ * @property {{t: number, x: number, y: number}[]} camPath
  */
 
 /**
@@ -39,6 +41,8 @@ import { parseCommands } from './commands.js';
  * @property {(level: number) => void} [onLevel]
  * @property {() => void} [onEnded]  The user stopped sharing from the browser bar.
  * @property {(msg: string) => void} [onWarn]
+ * @property {(paused: boolean) => void} [onPauseChange]  "pause" / "resume" heard.
+ * @property {() => void} [onStopRequested]  "stop recording" heard.
  */
 
 const LEVEL_DT = 0.05;
@@ -95,13 +99,44 @@ export class Recorder {
     this.thumbs = [];
     this.t0 = 0;
     this.running = false;
+    this.paused = false;
+    this.pauseAt = 0;
+    this.pausedTotal = 0;
+    /** @type {number[]} where the recording was paused */
+    this.joins = [];
+    /** @type {{t: number, x: number, y: number}[]} where the floating bubble was */
+    this.camPath = [];
     /** @type {MediaStream[]} */
     this.streams = [];
   }
 
   /** Seconds since recording started. */
   now() {
-    return this.running ? (performance.now() - this.t0) / 1000 : 0;
+    if (!this.running) return 0;
+    const at = this.paused ? this.pauseAt : performance.now();
+    return (at - this.t0 - (this.pausedTotal || 0)) / 1000;
+  }
+
+  /** Pause: nothing is recorded until resume(). */
+  pause() {
+    if (!this.running || this.paused) return;
+    this.rec?.pause();
+    this.camRec?.pause();
+    this.joins.push(this.now());
+    this.pauseAt = performance.now();
+    this.paused = true;
+    this.ev.onPauseChange?.(true);
+  }
+
+  resume() {
+    if (!this.running || !this.paused) return;
+    const gap = performance.now() - this.pauseAt;
+    this.pausedTotal = (this.pausedTotal || 0) + gap;
+    this.audioT0 += gap / 1000; // the audio clock kept running while paused
+    this.rec?.resume();
+    this.camRec?.resume();
+    this.paused = false;
+    this.ev.onPauseChange?.(false);
   }
 
   /**
@@ -148,6 +183,8 @@ export class Recorder {
     video.addEventListener('ended', () => this.ev.onEnded?.());
     const settings = video.getSettings();
     this.width = settings.width || 1280;
+    /** 'monitor' when the whole screen is shared: then the floating bubble's position can be tracked. */
+    this.surface = /** @type {any} */ (settings).displaySurface || '';
     this.height = settings.height || 720;
 
     // Mix mic (+ shared tab/system audio) into one track, and meter the mic.
@@ -171,7 +208,7 @@ export class Recorder {
     meter.connect(sink).connect(actx.destination);
     meter.port.onmessage = (e) => {
       this.ev.onLevel?.(e.data.rms);
-      if (!this.running) return;
+      if (!this.running || this.paused) return;
       const t = e.data.t - this.audioT0;
       const i = Math.floor(t / LEVEL_DT);
       if (i >= 0) this.levelValues[i] = e.data.rms;
@@ -248,6 +285,7 @@ export class Recorder {
 
     /** @param {CanvasImageSource} img */
     const sample = (img) => {
+      if (this.paused) return;
       const t = this.now();
       if (t >= nextSample) {
         nextSample = t + MOTION_EVERY;
@@ -319,9 +357,18 @@ export class Recorder {
             // Recognition reports the first words ~0.5s after they were spoken.
             const start = Math.max(0, /** @type {number} */ (firstSeen.get(i)) - 0.6);
             const phrase = { text, start, end: t };
+            const cmds = parseCommands([phrase]);
+            if (this.paused) {
+              // While paused, only listen for "resume" or "stop"; nothing else is kept.
+              if (cmds.some((c) => c.type === 'resume')) this.resume();
+              if (cmds.some((c) => c.type === 'stop')) this.ev.onStopRequested?.();
+              continue;
+            }
             this.phrases.push(phrase);
             this.ev.onPhrase?.(phrase);
-            for (const c of parseCommands([phrase])) this.ev.onCommand?.(c);
+            for (const c of cmds) this.ev.onCommand?.(c);
+            if (cmds.some((c) => c.type === 'pause')) this.pause();
+            if (cmds.some((c) => c.type === 'stop')) this.ev.onStopRequested?.();
           } else interim += ` ${text}`;
         }
         this.ev.onInterim?.(interim.trim());
@@ -349,6 +396,11 @@ export class Recorder {
 
   /** @returns {Promise<RawTake>} */
   async stop() {
+    if (this.paused) {
+      // Stopping while paused: end the video at the pause.
+      this.rec?.resume();
+      this.camRec?.resume();
+    }
     const duration = this.now();
     this.running = false;
     this.listening = false;
@@ -397,6 +449,8 @@ export class Recorder {
       // The screen clock starts when its recorder starts; the camera's may differ slightly.
       camOffset: camBlob && this.camT0 ? (this.camT0 - this.t0) / 1000 : 0,
       hasCamera: Boolean(camBlob),
+      joins: this.joins,
+      camPath: this.camPath,
     };
   }
 }
