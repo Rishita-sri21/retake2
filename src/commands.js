@@ -20,7 +20,8 @@
  *   'hide'|'unhide'|'hideScreen'|'showScreen'|
  *   'zoomIn'|'zoomOut'|'highlight'|'speedUp'|'normalSpeed'|
  *   'chapter'|'title'|'mark'|
- *   'camBig'|'camSmall'|'camHide'|'camShow'|
+ *   'camBig'|'camSmall'|'camHide'|'camShow'|'camSwap'|
+ *   'slide'|'point'|'endSlide'|
  *   'pause'|'resume'|'stop'} CommandType
  */
 
@@ -29,6 +30,7 @@
  * @property {string} text
  * @property {number} start  Seconds from the start of the recording.
  * @property {number} end
+ * @property {boolean} [typed]  Arrived as text (typed, or dictated with Wispr Flow), not from speech recognition.
  */
 
 /**
@@ -41,6 +43,7 @@
  * @property {boolean} standalone  The phrase is (almost) only the command.
  * @property {number} before       Narration words before the command in the same phrase.
  * @property {[number, number]} span  Word indices [first, last] of the command in the phrase, modifiers included.
+ * @property {boolean} [typed]  Came from the command box (typed or dictated with Wispr Flow).
  * @property {'before'|'after'} [needsPause]  Said at the edge of a longer phrase: only counts if there's a pause on this side of it.
  * @property {string} [label]      Title text for chapter/title.
  * @property {number} [seconds]    "for 10 seconds", "last 5 seconds".
@@ -83,6 +86,9 @@ const NUM = `(\\d+(?:[.,]\\d+)?|${Object.keys(NUMBERS).sort((a, b) => b.length -
  * @param {string} src
  */
 const L = (src) => new RegExp(`(?<![\\p{L}\\p{M}\\p{N}])(?:${src})(?![\\p{L}\\p{M}\\p{N}])`, 'du');
+
+/** Commands that carry what you said after them as a label (a title, a bullet). */
+export const LABELLED = new Set(['chapter', 'title', 'slide', 'point']);
 
 /** @type {Grammar[]} */
 export const GRAMMAR = [
@@ -257,10 +263,21 @@ export const GRAMMAR = [
     name: 'Spotlight',
     say: 'look here',
     patterns: [
-      L(`(?:highlight|spotlight|circle|point at) (?:that|this|it|here)|look here|right here|over here|check this out`),
+      L(`(?:highlight|spotlight|circle|point at) (?:that|this|it|here)|look here`),
       L(`yahan dekho|idhar dekho|यहाँ देखो|यहां देखो|इधर देखो`),
       L(`mira aqui|fijate aqui|regarde(?:z)? ici|schau (?:mal )?hier|guck (?:mal )?hier|olha aqui|guarda qui`),
     ],
+  },
+  {
+    // Everyday words that are only a direction when said on their own.
+    type: 'highlight',
+    group: 'Zoom',
+    name: 'Spotlight',
+    say: 'right here',
+    hidden: true,
+    standaloneOnly: true,
+    exact: true,
+    patterns: [L(`right here|over here|check this out`)],
   },
   // ---------------------------------------------------------------- time
   {
@@ -380,6 +397,41 @@ export const GRAMMAR = [
     ],
   },
   // ---------------------------------------------------------------- your camera bubble
+  // ---------------------------------------------------------------- slides, said into being
+  {
+    type: 'slide',
+    group: 'Slides',
+    name: 'Slide',
+    say: 'slide: why it matters',
+    patterns: [
+      /^(?:(?:okay|ok|so|and|now|right|alright)[,]?\s+)*(?:new |next |a )?slide[:,.]?\s+(?:(?:one|two|three|four|five|six|\d+)[:,.]?\s+)?(?:is |called )?(.{2,60}?)\s*[.!]?$/du,
+      /^(?:अगली\s+)?(?:स्लाइड)[:,]?\s+(.{2,60}?)\s*[।.]?$/du,
+      /^(?:nueva |nouvelle |neue |nuova )?(?:diapositiva|diapo|folie|slide|lamina)[:,.]?\s+(.{2,60}?)\s*[.!]?$/du,
+    ],
+  },
+  {
+    type: 'point',
+    group: 'Slides',
+    name: 'Bullet point',
+    say: 'point: works in any language',
+    patterns: [
+      /^(?:(?:and|next|another|new|okay|ok|so)[,]?\s+)*(?:bullet point|bullet|key point|point|add a point)[:,.]?\s+(?!(?:at|to|out|is|of|being|taken|made|here|there)\b)(?:(?:one|two|three|four|five|\d+)[:,.]?\s+)?(.{2,80}?)\s*[.!]?$/du,
+      /^(?:पॉइंट|बिंदु)[:,]?\s+(.{2,80}?)\s*[।.]?$/du,
+      /^(?:punto|punkt|ponto)[:,.]?\s+(?!(?:at|to|out|is|of)\b)(.{2,80}?)\s*[.!]?$/du,
+    ],
+  },
+  {
+    type: 'endSlide',
+    group: 'Slides',
+    name: 'End the slide',
+    say: 'end slide',
+    standaloneOnly: true,
+    patterns: [
+      L(`end (?:the |this )?slide|close (?:the |this )?slide|(?:clear|hide|remove) (?:the )?(?:points|bullets|bullet points|slide)|no more points|that'?s all the points|slide (?:done|over)`),
+      L(`slide (?:khatam|band) karo|points hatao|स्लाइड बंद करो`),
+      L(`fin de la diapositiva|cierra la diapositiva|fin de la diapo|folie beenden|fecha o slide|chiudi la slide`),
+    ],
+  },
   {
     type: 'camBig',
     group: 'You',
@@ -399,7 +451,7 @@ export const GRAMMAR = [
     say: 'small camera',
     standaloneOnly: true,
     patterns: [
-      L(`(?:small|smaller|little|mini) ?(?:camera|cam|camra|kamera)|(?:camera|cam) (?:small|smaller|in (?:the |to the )?corner|to (?:the )?corner)|(?:go |come |and )?back to (?:the |this |my |your )?(?:screen|screens|scream|screen share|desktop|demo|code)|back to it|back to work|show the screen now|shrink (?:the |my )?camera|face away`),
+      L(`(?:small|smaller|little|mini) ?(?:camera|cam|camra|kamera)|(?:camera|cam) (?:small|smaller|in (?:the |to the )?corner|to (?:the )?corner)|(?:go |come |and )?back to (?:the |this |my |your )?(?:screen|screens|scream|screen share|desktop|demo|code)|back to it|back to work|(?:switch|swap|flip) (?:it )?back|show the screen now|shrink (?:the |my )?camera|face away`),
       L(`camera chhota (?:karo|kar do)|chhota camera|screen pe wapas|कैमरा छोटा करो|छोटा कैमरा`),
       L(`camara pequena|vuelve a la pantalla|petite camera|retour a l'ecran|kleine kamera|zuruck zum bildschirm|camera pequena|volta para a tela|camera piccola|torna allo schermo`),
     ],
@@ -426,6 +478,18 @@ export const GRAMMAR = [
       L(`show (?:the |my )?camera|camera on|camera back`),
       L(`camera (?:chalu|on) (?:karo|kar do)|कैमरा चालू करो`),
       L(`muestra la camara|montre la camera|kamera an|mostra a camera|mostra la (?:tele)?camera`),
+    ],
+  },
+  {
+    type: 'camSwap',
+    group: 'You',
+    name: 'Switch the screen',
+    say: 'switch the screen',
+    standaloneOnly: true,
+    patterns: [
+      L(`(?:switch|swap|flip) (?:the )?(?:screen|screens|view|views|places|sides)|me on the big screen|put me (?:in front|up front)`),
+      L(`screen (?:badlo|switch karo)|स्क्रीन बदलो`),
+      L(`cambia la (?:pantalla|vista)|change (?:d'|de )?(?:ecran|vue)|wechsel(?:e)? die ansicht|troca a tela|cambia (?:lo schermo|la vista)`),
     ],
   },
 ];
@@ -611,7 +675,7 @@ export function parseCommands(phrases) {
       if (taken.has(g.type) || claimed.some(([x, y]) => a < y && b > x)) continue;
       claimed.push([a, b]);
       taken.add(g.type);
-      const labelled = g.type === 'chapter' || g.type === 'title';
+      const labelled = LABELLED.has(g.type);
       const standalone = labelled ? words(beforeText).filter((w) => !FILLER.has(w)).length <= 1 : narration.length <= 2;
       /** @type {Command} */
       const cmd = {
@@ -643,9 +707,9 @@ export function parseCommands(phrases) {
     }
   });
   // A chapter phrase like "chapter: zoom in on the chart" is a chapter, not a zoom.
-  const chapterPhrases = new Set(out.filter((c) => c.type === 'chapter' || c.type === 'title').map((c) => c.phrase));
+  const chapterPhrases = new Set(out.filter((c) => LABELLED.has(c.type)).map((c) => c.phrase));
   return out
-    .filter((c) => c.type === 'chapter' || c.type === 'title' || !chapterPhrases.has(c.phrase))
+    .filter((c) => LABELLED.has(c.type) || !chapterPhrases.has(c.phrase))
     .sort((x, y) => x.phrase - y.phrase || x.span[0] - y.span[0]);
 }
 
@@ -666,7 +730,7 @@ export function recordingControl(text) {
  * @param {string} text
  */
 export function stripCommands(text) {
-  const cmds = parseCommands([{ text, start: 0, end: 1 }]).filter((c) => c.type !== 'chapter' && c.type !== 'title');
+  const cmds = parseCommands([{ text, start: 0, end: 1 }]).filter((c) => !LABELLED.has(c.type));
   const w = text.normalize('NFC').replace(/\s+/g, ' ').trim().split(' ');
   const drop = new Set();
   for (const c of cmds) for (let i = c.span[0]; i <= c.span[1]; i++) drop.add(i);
@@ -732,5 +796,13 @@ export function describe(c) {
       return 'Camera hidden';
     case 'camShow':
       return 'Camera shown';
+    case 'camSwap':
+      return 'Switched: you in front, the screen in the bubble';
+    case 'slide':
+      return `Slide: ${c.label}`;
+    case 'point':
+      return `Point: ${c.label}`;
+    case 'endSlide':
+      return 'Ended the slide';
   }
 }

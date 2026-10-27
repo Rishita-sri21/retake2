@@ -288,7 +288,7 @@ test('hide for N seconds, until "show it", and the whole screen', () => {
   const forTen = buildPlan(take([P('hide that for ten seconds', 6, 8)], 30, motion), { trimDeadAir: false }).blurs[0];
   assert.ok(Math.abs(forTen.src1 - 17.5) < 0.6, `ends ${forTen.src1}`);
   const until = buildPlan(take([P('hide that', 6, 7), P('show it', 20, 21)], 30, motion), { trimDeadAir: false }).blurs[0];
-  assert.ok(Math.abs(until.src1 - 20.6) < 0.6, `ends ${until.src1}`);
+  assert.ok(Math.abs(until.src1 - 20) < 0.4, `ends as you say it: ${until.src1}`);
   const screen = buildPlan(take([P('hide the screen', 3, 4), P('show the screen', 9, 10)], 30), { trimDeadAir: false }).blurs[0];
   assert.equal(screen.full, true);
   assert.deepEqual(screen.box, { x: 0, y: 0, w: 1, h: 1 });
@@ -503,4 +503,78 @@ test('"scratch that" works however the recogniser groups the words, and the reta
 test('the product name in a sentence is not a command', () => {
   assert.equal(parseCommands([P("hi, I'm going to show you how retake works", 0, 3)]).length, 0);
   assert.equal(parseCommands([P('retake', 0, 1)])[0]?.type, 'cut');
+});
+
+// ---------------------------------------------------------------- round 5
+
+test('"hide that" on its own blurs for a few seconds, not to the end', async () => {
+  const { HIDE_DEFAULT } = await import('../src/plan.js');
+  const motion = motionLog(60, [{ t0: 5, t1: 5.4, x0: 4, x1: 30, y0: 6, y1: 7 }]);
+  const b = buildPlan(take([P('hide that', 6, 7), P('much later, show it', 50, 52)], 60, motion), { trimDeadAir: false }).blurs[0];
+  assert.ok(b.src1 < 7 + HIDE_DEFAULT + 0.5, `ends ${b.src1}`);
+});
+
+test('a late final result cannot stretch "scratch that" over the retake', () => {
+  // You stumble 1–3.6, say "scratch that" 4.1–4.8, then the retake 5.0–7.5 with no
+  // recogniser hint of when it started (its first result arrived very late).
+  const t = voiceTake([P('so first we open the uh the setting thingy', 1.4, 4.0), P('scratch that', 4.4, 7.0), P('first we open the settings', 8.4, 9.5)], [[1, 3.6], [4.1, 4.8], [5.0, 7.5]], 12);
+  const plan = buildPlan(t, { trimDeadAir: false });
+  const cut = plan.cuts.find((c) => c.reason === 'fumble');
+  assert.ok(cut.src1 <= 5.05, `cut ends ${cut.src1.toFixed(2)}, before the retake`);
+  assert.ok(cut.src0 <= 1.05, 'the stumble is cut');
+});
+
+test('"scratch that" after a long sentence cuts only its last stretch', () => {
+  // A 9-second phrase: two good sentences, a pause, then the stumble.
+  const t = voiceTake([P('this dashboard shows the forecast for every city and it updates every hour so the uh the thing with the', 1.2, 10.4), P('scratch that', 10.8, 11.8)], [[1, 4.5], [4.8, 7.4], [8.1, 10.2], [10.7, 11.3]], 14);
+  const plan = buildPlan(t, { trimDeadAir: false });
+  const cut = plan.cuts.find((c) => c.reason === 'fumble');
+  assert.ok(cut.src0 > 7.3 && cut.src0 < 8.2, `cut starts ${cut.src0.toFixed(2)}`);
+});
+
+test('a command dictated into the command box with Wispr Flow is timed from the voice and wins over the recogniser', async () => {
+  const { gainAt } = await import('../src/plan.js');
+  const moving = motionLog(12, [{ t0: 0, t1: 12, x0: 10, x1: 20, y0: 10, y1: 20 }]);
+  // You said "zoom in on the top right" 4.0–5.2; Wispr typed it at 5.9.
+  // Chrome misheard it as "soon in on the top right" and finalised it late.
+  const misheard = voiceTake([P('here is the chart', 1, 3.2), P('soon in on the top right', 4.3, 6.8), { text: 'Zoom in on the top right.', start: 5.5, end: 5.9, typed: true }, P('it updates live', 7, 8.6)], [[1, 3], [4, 5.2], [7, 8.4]], 12, moving);
+  const a = buildPlan(misheard, { trimDeadAir: false });
+  const z = a.view.find((v) => v.scale > 1);
+  assert.ok(z && Math.abs(z.src - 4.05) < 0.15, `zoom starts as you said it (${z && z.src.toFixed(2)})`);
+  assert.ok(!a.captions.some((c) => /soon/.test(c.text)), 'the misheard words are not captioned');
+  assert.equal(gainAt(a, 4.6), 0, 'the dictated command is silenced');
+  assert.equal(gainAt(a, 7.6), 1);
+  // Both heard it: one zoom, not two.
+  const both = voiceTake([P('zoom in', 4.3, 6.0), { text: 'zoom in', start: 5.2, end: 5.6, typed: true }], [[4, 4.8]], 10, moving);
+  assert.equal(buildPlan(both, { trimDeadAir: false }).commands.filter((c) => c.type === 'zoomIn').length, 1);
+});
+
+test('slides, points and switching the screen', async () => {
+  const { cameraModeAt } = await import('../src/plan.js');
+  const t = take([P('slide: why editing hurts', 1, 3), P('point: it takes hours', 4, 6), P('point: it needs skills', 7, 9), P('end slide', 10, 11), P('point: free', 13, 14), P('switch the screen', 16, 17), P('switch back', 20, 21)], 40);
+  const plan = buildPlan(t, { trimDeadAir: false });
+  const [slide, list] = plan.boards;
+  assert.equal(slide.full, true);
+  assert.equal(slide.title, 'Why editing hurts');
+  assert.deepEqual(slide.items.map((i) => i.text), ['It takes hours', 'It needs skills']);
+  assert.ok(slide.src1 > 9.5 && slide.src1 < 10.6, `slide ends ${slide.src1}`);
+  assert.equal(list.full, false);
+  assert.ok(list.src1 > 19.5 && list.src1 < 27, 'a list of points ends with "switch back" (or fades by itself)');
+  assert.equal(cameraModeAt(plan, 18.5).to, 'swap');
+  assert.equal(cameraModeAt(plan, 22.5).to, 'small');
+});
+
+test('a dictated command is matched to its own words even when you have started the next sentence', async () => {
+  const { gainAt } = await import('../src/plan.js');
+  const moving = motionLog(14, [{ t0: 0, t1: 14, x0: 10, x1: 20, y0: 10, y1: 20 }]);
+  // "switch the screen" 4.0–5.0 (heard as "swish the scream"); next sentence from 5.7;
+  // Wispr's text arrived at 5.9, while you were already talking.
+  const t = voiceTake([P('swish the scream', 4.2, 6.6), { text: 'switch the screen', start: 5.8, end: 6.2, typed: true }, P('I built it the same way', 6.0, 8.5)], [[4, 5], [5.7, 8]], 14, moving);
+  const plan = buildPlan({ ...t, cameraStart: 'small' }, { trimDeadAir: false });
+  const swap = plan.camera.find((c) => c.mode === 'swap');
+  assert.ok(swap && Math.abs(swap.src - 4.05) < 0.15, `switch at ${swap && swap.src.toFixed(2)}`);
+  assert.equal(gainAt(plan, 4.5), 0, 'the dictated words are silenced');
+  assert.equal(gainAt(plan, 6.4), 1, 'the next sentence is heard');
+  assert.ok(!plan.captions.some((c) => /swish/.test(c.text)), 'the misheard words are not captioned');
+  assert.ok(plan.captions.some((c) => /^I built/.test(c.text)), 'the next sentence is captioned whole');
 });

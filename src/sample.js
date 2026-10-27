@@ -11,6 +11,7 @@
  * The screen-motion log is computed from the drawn frames by the same code
  * that analyses a real recording; nothing about the edit is pre-baked.
  */
+import { SAMPLE_LEVELS } from './sample-levels.js';
 import { GRID_W, GRID_H, toGrid, diff } from './motion.js';
 
 export const SAMPLE_W = 1280;
@@ -254,14 +255,9 @@ export function drawSample(ctx, t, W, H) {
  */
 export function buildSampleTake() {
   const dt = 0.05;
+  // Measured from the sample's narration (assets/sample-voice.mp3).
   const values = new Float32Array(Math.ceil(SAMPLE_DURATION / dt));
-  for (let i = 0; i < values.length; i++) values[i] = 0.006 + 0.004 * Math.abs(Math.sin(i * 1.7));
-  for (const p of SAMPLE_PHRASES) {
-    for (let x = p.start; x < p.end - 0.35; x += dt) {
-      const i = Math.floor(x / dt);
-      values[i] = 0.18 + 0.15 * Math.abs(Math.sin(i * 0.9));
-    }
-  }
+  values.set(SAMPLE_LEVELS.slice(0, values.length));
 
   // Motion: render small frames and diff them, exactly as the recorder does.
   const SW = GRID_W * 5, SH = GRID_H * 5;
