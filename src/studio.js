@@ -42,7 +42,7 @@ const BEATS = [
 const stage = $('stage');
 function fit() {
   const s = Math.min(innerWidth / 1920, innerHeight / 1080);
-  stage.style.transform = `scale(${s})`;
+  stage.style.transform = `translate(-50%, -50%) scale(${s})`;
   stage.dataset.scale = String(s);
 }
 addEventListener('resize', fit);
@@ -400,28 +400,56 @@ async function runLang(sig) {
 // ---------------------------------------------------------------- scene: Wispr Flow → Retake
 
 const wsInput = /** @type {HTMLInputElement} */ ($('ws-input'));
-let wsTimer = 0, wsFirst = 0;
-function wsSend() {
-  clearTimeout(wsTimer);
-  const text = wsInput.value.trim();
-  if (!text) return;
-  const age = wsFirst ? (performance.now() - wsFirst) / 1000 : 0;
-  wsFirst = 0;
-  const cmds = recorder?.typed(text, age) ?? parseCommands([{ text, start: 0, end: 1 }]);
+/** The invisible command box that keeps focus, so Wispr Flow can type every command into Retake. */
+const sink = /** @type {HTMLInputElement} */ ($('wispr-sink'));
+
+/**
+ * A command box: Wispr Flow (or the keyboard) types into it; after a short
+ * pause the text goes to the recorder, timed from when it started arriving.
+ * @param {HTMLInputElement} box @param {(text: string, cmds: import('./commands.js').Command[]) => void} onSent
+ */
+function wireBox(box, onSent) {
+  let timer = 0, first = 0;
+  const send = () => {
+    clearTimeout(timer);
+    const text = box.value.trim();
+    if (!text) return;
+    const age = first ? (performance.now() - first) / 1000 : 0;
+    first = 0;
+    const cmds = recorder?.typed(text, age) ?? parseCommands([{ text, start: 0, end: 1 }]);
+    onSent(text, cmds);
+  };
+  box.addEventListener('input', () => {
+    if (!first && box.value) first = performance.now();
+    clearTimeout(timer);
+    timer = window.setTimeout(send, 800); // Wispr pastes the phrase at once
+  });
+  box.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      send();
+    }
+  });
+}
+wireBox(wsInput, (text, cmds) => {
   $('ws-done').textContent = cmds.length ? `✓ ${describe(cmds[0])}` : `Not a command: “${text}”`;
   setTimeout(() => {
     if (wsInput.value.trim() === text) wsInput.value = '';
   }, 1600);
+});
+wireBox(sink, (text, cmds) => {
+  sink.value = '';
+  lastHeard = cmds.length ? `✓ via Wispr: ${describe(cmds[0])}` : `Wispr typed “${text}” (not a command)`;
+  setHeard(lastHeard);
+});
+$('ws-form').addEventListener('submit', (e) => e.preventDefault());
+/** Keep the invisible box focused (except in the Wispr scene, where the visible one is). */
+function focusSink() {
+  if (!started || BEATS[Math.max(0, beat)]?.scene === 'wispr') return;
+  if (document.activeElement !== sink) sink.focus({ preventScroll: true });
 }
-wsInput.addEventListener('input', () => {
-  if (!wsFirst && wsInput.value) wsFirst = performance.now();
-  clearTimeout(wsTimer);
-  wsTimer = window.setTimeout(wsSend, 800); // Wispr pastes the phrase at once
-});
-$('ws-form').addEventListener('submit', (e) => {
-  e.preventDefault();
-  wsSend();
-});
+addEventListener('click', () => setTimeout(focusSink, 0));
+addEventListener('focus', () => setTimeout(focusSink, 0));
 
 /** @param {AbortSignal} sig */
 async function runWispr(sig) {
@@ -460,6 +488,7 @@ async function go(i) {
   if (b.scene !== 'app') hideCursor();
   if (b.scene !== 'wispr' && document.activeElement === wsInput) wsInput.blur();
   renderPrompter();
+  setTimeout(focusSink, 50);
   if (continuing) return;
   running?.abort();
   const ctl = (running = new AbortController());
@@ -471,8 +500,8 @@ frame.addEventListener('load', () => frame.contentWindow?.addEventListener('keyd
 /** @param {KeyboardEvent} e */
 function onKey(e) {
   if (!started) return;
-  const typing = e.target === wsInput;
-  if (['ArrowRight', 'PageDown'].includes(e.key) || (e.key === ' ' && !typing)) {
+  const typing = e.target === wsInput || (e.target === sink && sink.value.trim() !== '');
+  if (['ArrowRight', 'PageDown'].includes(e.key)) {
     if (typing && wsInput.value.trim()) return; // finish the command first
     e.preventDefault();
     go(beat + 1);
@@ -513,6 +542,8 @@ const PROMPTER_CSS = `
   main p.w{padding-left:2px} .tag{display:inline-block;margin-right:8px;padding:2px 8px;border-radius:999px;background:#e8c9a0;color:#1d160c;font-size:12px;font-style:normal;letter-spacing:.06em;text-transform:uppercase;vertical-align:4px}
   .note{font-size:13px;color:#a8a399} .next{font-size:13px;color:#6f6b64;margin-top:2px}
   .heard{min-height:18px;font-size:13px;color:#9ec9a9}
+  .status{margin:0 0 2px;font-size:12px;color:#a8a399} .status .ok{color:#9ec9a9} .status .bad{color:#ec8f8f}
+  main .lead{font-size:12px;color:#a8a399;margin:0 0 8px;letter-spacing:.02em}
   .count{display:grid;place-items:center;height:100%;font:400 120px/1 "Instrument Serif",Georgia,serif;color:#e8c9a0}
   .stop{margin-left:10px;border:1px solid #3a3a42;background:none;color:#f4f1ea;border-radius:999px;padding:3px 10px;font:12px system-ui;cursor:pointer}`;
 
@@ -527,11 +558,34 @@ function renderPrompter() {
   const recTime = recorder ? fmt(recorder.now()) : started ? 'Rehearsal' : 'Not recording';
   doc.body.innerHTML = `
     <header><span><b>${Math.max(0, beat) + 1} / ${BEATS.length}</b> · ${esc(b.title)}</span><span><span class="rec ${recorder ? '' : 'off'}">● ${esc(recTime)}</span>${recorder ? '<button class="stop" id="p-stop">Stop</button>' : ''}</span></header>
-    <main>${sayHtml(b.say)}<p class="note">${esc(b.note)}</p></main>
-    <footer><p class="heard" id="p-heard">${esc(lastHeard)}</p><p class="next">${next ? `Next: ${esc(next.title)} · press → when you finish` : 'Last beat. Say “stop recording”.'}</p></footer>`;
+    <main><p class="lead">Gold lines are commands: hold your Wispr Flow key while you say them.</p>${sayHtml(b.say)}<p class="note">${esc(b.note)}</p></main>
+    <footer><p class="status" id="p-status"></p><p class="heard" id="p-heard">${esc(lastHeard)}</p><p class="next">${next ? `Next: ${esc(next.title)} · press → when you finish` : 'Last beat. Say “stop recording”.'}</p></footer>`;
   doc.getElementById('p-stop')?.addEventListener('click', () => finish());
+  // Clicking the teleprompter must not leave Wispr typing into it: hand focus back.
+  doc.body.addEventListener('mouseup', () => {
+    window.focus();
+    setTimeout(focusSink, 0);
+  });
+  renderStatus();
 }
 let lastHeard = '';
+/** @type {'listening' | 'restarting' | 'blocked'} */
+let speechState = 'listening';
+let heardCount = 0;
+/** @param {string} text */
+function setHeard(text) {
+  const el = prompterDoc()?.getElementById('p-heard');
+  if (el) el.textContent = text;
+}
+/** One line on the teleprompter: is Retake hearing you, and can Wispr type into it? */
+function renderStatus() {
+  const el = prompterDoc()?.getElementById('p-status');
+  if (!el) return;
+  const wisprReady = document.hasFocus() && (document.activeElement === sink || document.activeElement === wsInput);
+  const hearing = !recorder ? 'Rehearsal' : speechState === 'restarting' ? '⟳ Restarting speech recognition' : speechState === 'blocked' ? '✕ Speech recognition blocked' : `● Hearing you · ${heardCount} lines`;
+  el.innerHTML = `<span class="${speechState === 'listening' ? 'ok' : 'bad'}">${esc(hearing)}</span> · <span class="${wisprReady ? 'ok' : 'bad'}">${wisprReady ? 'Wispr → Retake ready' : 'Click the stage so Wispr types into Retake'}</span>`;
+}
+setInterval(renderStatus, 700);
 
 async function openPrompter() {
   const dpip = /** @type {any} */ (window).documentPictureInPicture;
@@ -570,18 +624,20 @@ async function startRecording() {
     $('setup-note').textContent = 'Recording needs Chrome or Edge on a computer.';
     return;
   }
-  if (!prompterDoc()) await openPrompter().catch(() => null);
+  // The click's permission goes to the recording prompt first; the
+  // teleprompter (best opened beforehand) is tried afterwards.
   const lang = /** @type {HTMLSelectElement} */ ($('lang')).value;
   const r = new Recorder({
-    onInterim: (t) => {
-      const el = prompterDoc()?.getElementById('p-heard');
-      if (el) el.textContent = t ? `… ${t}` : lastHeard;
+    onInterim: (t) => setHeard(t ? `Hearing: ${t}` : lastHeard),
+    onSpeechState: (state, n) => {
+      speechState = state;
+      heardCount = n;
+      renderStatus();
     },
     onPhrase: () => {},
     onCommand: (c) => {
       lastHeard = `✓ ${describe(c)}`;
-      const el = prompterDoc()?.getElementById('p-heard');
-      if (el) el.textContent = lastHeard;
+      setHeard(lastHeard);
     },
     onLevel: () => {},
     onEnded: () => finish(),
@@ -590,13 +646,14 @@ async function startRecording() {
     onStopRequested: () => finish(),
   });
   try {
-    await r.prepare({ lang, systemAudio: false, camera: true, currentTab: true });
+    await r.prepare({ lang, systemAudio: false, camera: true, currentTab: true, cropTo: stage });
   } catch (e) {
     if (/** @type {any} */ (e)?.name !== 'NotAllowedError') $('setup-note').textContent = /** @type {Error} */ (e).message || 'Recording could not start.';
     return;
   }
   hideSetup();
   showScene('hook');
+  if (!prompterDoc()) await openPrompter().catch(() => null);
   // 3-2-1 on the teleprompter; Retake is already listening.
   const doc = prompterDoc();
   for (const n of [3, 2, 1]) {
