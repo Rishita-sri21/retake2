@@ -578,3 +578,23 @@ test('a dictated command is matched to its own words even when you have started 
   assert.ok(!plan.captions.some((c) => /swish/.test(c.text)), 'the misheard words are not captioned');
   assert.ok(plan.captions.some((c) => /^I built/.test(c.text)), 'the next sentence is captioned whole');
 });
+
+test('commands run together by the recogniser are split apart, and none of them is heard', async () => {
+  const { gainAt, splitCommandRuns } = await import('../src/plan.js');
+  // One phrase, as Chrome heard it: a slide, three points and "end slide", with short pauses.
+  const voice = [[1, 2.9], [3.4, 4.6], [5.1, 6.5], [7.0, 8.4], [8.9, 9.6], [10.4, 12.5]];
+  const t = voiceTake([P('slide editing is a second job point hours of cutting point skills and software point it never feels done end slide', 1.4, 10.4), P('so I built Retake', 10.6, 12.9)], voice, 15);
+  const plan = buildPlan(t, { trimDeadAir: false, commandStyle: 'mute' });
+  const [slide] = plan.boards;
+  assert.equal(slide.title, 'Editing is a second job');
+  assert.deepEqual(slide.items.map((i) => i.text), ['Hours of cutting', 'Skills and software', 'It never feels done']);
+  assert.ok(slide.src1 > 8.5 && slide.src1 < 9.3, `slide ends at "end slide" (${slide.src1.toFixed(2)})`);
+  for (const x of [2, 4, 6, 7.5, 9.2]) assert.equal(gainAt(plan, x), 0, `silent at ${x}`);
+  assert.equal(gainAt(plan, 11.5), 1);
+  assert.equal(plan.captions.map((c) => c.text).join(' '), 'so I built Retake');
+  // A title run into the next sentence: the title, then the narration.
+  const parts = splitCommandRuns([P('title edit out loud my last demo took four minutes to record', 1, 6)], { dt: 0.05, values: (() => { const v = new Float32Array(160); for (const [a, b] of [[1, 2.4], [2.9, 6]]) for (let x = a; x < b; x += 0.05) v[Math.floor(x / 0.05 + 1e-6)] = 0.3; return v; })() }, 0.04);
+  assert.deepEqual(parts.map((q) => q.text), ['title edit out loud', 'my last demo took four minutes to record']);
+  // Ordinary narration with "point" in it is left alone.
+  assert.equal(splitCommandRuns([P('at this point it was finished', 1, 3)], { dt: 0.05, values: new Float32Array(80) }, 0.04).length, 1);
+});

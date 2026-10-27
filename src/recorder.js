@@ -43,6 +43,8 @@ import { parseCommands, recordingControl } from './commands.js';
  * @property {(msg: string) => void} [onWarn]
  * @property {(paused: boolean) => void} [onPauseChange]  "pause" / "resume" heard.
  * @property {() => void} [onStopRequested]  "stop recording" heard.
+ * @property {(state: 'listening' | 'restarting' | 'blocked', heard: number) => void} [onSpeechState]
+ *   Speech recognition's health, and how many phrases it has heard.
  */
 
 const LEVEL_DT = 0.05;
@@ -143,8 +145,9 @@ export class Recorder {
    * Ask for the screen, mic and camera, and start listening. Recording itself
    * starts with begin(), after the countdown, so the listener is already warm
    * and your first words ("big camera") are heard.
-   * @param {{lang: string, systemAudio: boolean, camera: boolean, currentTab?: boolean}} opts
+   * @param {{lang: string, systemAudio: boolean, camera: boolean, currentTab?: boolean, cropTo?: Element}} opts
    *   currentTab: record this very tab (Retake Studio records its own stage).
+   *   cropTo: with currentTab, record only this element (Region Capture), e.g. the 16:9 stage.
    */
   async prepare(opts) {
     this.lang = opts.lang;
@@ -183,6 +186,17 @@ export class Recorder {
 
     const video = display.getVideoTracks()[0];
     video.addEventListener('ended', () => this.ev.onEnded?.());
+    // Region Capture: keep only the element asked for (Chrome 104+), so the
+    // recording is exactly the stage, whatever the window's shape.
+    const CT = /** @type {any} */ (window).CropTarget;
+    if (opts.cropTo && CT && 'cropTo' in video) {
+      try {
+        await /** @type {any} */ (video).cropTo(await CT.fromElement(opts.cropTo));
+        this.cropped = true;
+      } catch {
+        this.cropped = false;
+      }
+    }
     const settings = video.getSettings();
     this.width = settings.width || 1280;
     /** 'monitor' when the whole screen is shared: then the floating bubble's position can be tracked. */
@@ -415,6 +429,8 @@ export class Recorder {
       for (const id of pending.values()) clearTimeout(id);
       pending.clear();
       r.onresult = (/** @type {any} */ e) => {
+        this.lastResultAt = performance.now();
+        if (this.speechState !== 'listening') this.setSpeechState('listening');
         const t = this.now();
         let interim = '';
         for (let i = e.resultIndex; i < e.results.length; i++) {
@@ -458,6 +474,7 @@ export class Recorder {
             continue;
           }
           this.phrases.push(phrase);
+          this.ev.onSpeechState?.(this.speechState || 'listening', this.phrases.length);
           this.ev.onPhrase?.(phrase);
           for (const c of cmds) this.ev.onCommand?.(c);
           if (!early) {
@@ -476,7 +493,9 @@ export class Recorder {
         }
       };
       r.onend = () => {
+        this.awaitingEnd = false;
         if (this.listening && !this.speechBlocked) setTimeout(open, 100);
+        else if (this.speechBlocked) this.setSpeechState('blocked');
       };
       try {
         r.start();
@@ -486,6 +505,41 @@ export class Recorder {
       this.speech = r;
     };
     open();
+    // Watchdog: Chrome's recogniser sometimes goes quiet without ending (a
+    // network blip, a long take). If you're clearly talking and nothing has
+    // been heard for 4 seconds, start it afresh.
+    this.lastResultAt = performance.now();
+    clearInterval(this.watchdog);
+    this.watchdog = window.setInterval(() => {
+      if (!this.listening || this.speechBlocked || this.paused) return;
+      const quiet = (performance.now() - (this.lastResultAt || 0)) / 1000;
+      if (quiet < 4) return;
+      const v = this.levelValues, now = this.running ? Math.floor(this.now() / LEVEL_DT) : -1;
+      let loud = 0;
+      for (let i = Math.max(0, now - 60); i <= now; i++) if ((v[i] || 0) > 0.03) loud++;
+      if (loud < 8 && this.running) return; // you're not talking: nothing to hear
+      this.setSpeechState('restarting');
+      this.lastResultAt = performance.now();
+      this.awaitingEnd = true;
+      try {
+        this.speech?.abort();
+      } catch {
+        /* ended already */
+      }
+      // Normally abort() ends it and onend opens a new one; if it's wedged, open one anyway.
+      setTimeout(() => {
+        if (this.listening && this.awaitingEnd) {
+          this.awaitingEnd = false;
+          open();
+        }
+      }, 1500);
+    }, 2000);
+  }
+
+  /** @param {'listening' | 'restarting' | 'blocked'} state */
+  setSpeechState(state) {
+    this.speechState = state;
+    this.ev.onSpeechState?.(state, this.phrases.length);
   }
 
   /** @returns {Promise<RawTake>} */
@@ -498,6 +552,7 @@ export class Recorder {
     const duration = this.now();
     this.running = false;
     this.listening = false;
+    clearInterval(this.watchdog);
     try {
       this.speech?.stop();
     } catch {

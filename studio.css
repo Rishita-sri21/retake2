@@ -20,14 +20,17 @@ html, body { margin: 0; height: 100%; background: #000; color: var(--text); font
 [hidden] { display: none !important; }
 em { font-style: italic; color: var(--accent); }
 
-.viewport { position: fixed; inset: 0; display: grid; place-items: center; background: #000; }
+.viewport { position: fixed; inset: 0; overflow: hidden; background: #000; }
+/* Centred at any window shape: anchored at the middle, then scaled about its own centre. */
 .stage {
-  position: relative;
+  position: absolute;
+  left: 50%;
+  top: 50%;
   width: 1920px;
   height: 1080px;
-  flex: none;
   overflow: hidden;
-  transform-origin: center center;
+  transform-origin: 50% 50%;
+  transform: translate(-50%, -50%);
   background: radial-gradient(1200px 700px at 85% -10%, rgba(232, 201, 160, 0.08), transparent 60%), var(--bg);
 }
 
@@ -180,3 +183,5 @@ em { font-style: italic; color: var(--accent); }
 .setup button:hover { border-color: var(--muted); }
 .setup button.primary { background: var(--text); color: var(--bg); border-color: var(--text); }
 .setup-note { margin: 12px 0 0; color: var(--accent); min-height: 1em; }
+/* The invisible, always-focused command box (outside the recorded stage). */
+.sink { position: fixed; left: 0; bottom: 0; width: 2px; height: 2px; opacity: 0.01; border: 0; padding: 0; background: transparent; color: transparent; caret-color: transparent; z-index: 1; }

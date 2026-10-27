@@ -277,7 +277,7 @@ export function refinePhrases(take, threshold) {
 export function phrasesOf(take, threshold) {
   const speech = take.phrases.filter((p) => !p.typed);
   const box = take.phrases.filter((p) => p.typed);
-  if (!box.length) return refinePhrases(take, threshold);
+  if (!box.length) return splitCommandRuns(refinePhrases(take, threshold), take.levels, threshold);
   let refined = refinePhrases({ ...take, phrases: speech }, threshold);
   const lv = take.levels, dt = lv.dt;
   const mask = lv.values.length ? voiceMask(lv, threshold) : null;
@@ -309,13 +309,151 @@ export function phrasesOf(take, threshold) {
         from = start - dt;
         continue;
       }
+      // "Point: skills and software" — a label word is followed by a pause (the
+      // colon). If the command starts with one, take in the short burst of
+      // voice just before the pause: that's the label word itself.
+      const firstWord = (p.text.trim().split(/\s+/)[0] || '').toLowerCase().replace(/[^\p{L}]/gu, '');
+      if (MARKERS.has(firstWord) || firstWord === 'end') {
+        let t = start - dt, gap = 0;
+        while (t > 0 && !on(t) && gap < 0.8) (t -= dt), (gap += dt);
+        if (on(t) && gap < 0.8) {
+          let s0 = t;
+          while (s0 > 0 && on(s0 - dt)) s0 -= dt;
+          if (t - s0 <= 0.9) start = s0;
+        }
+      }
       return { ...p, start: Math.max(0, start - 0.04), end: Math.min(end + 0.04, p.end) };
     }
     return { ...p, start: Math.max(0, p.end - 0.3), end: p.end }; // typed by hand: no voice to find
   });
   const overlap = (/** @type {Phrase} */ a, /** @type {Phrase} */ b) => Math.max(0, Math.min(a.end, b.end) - Math.max(a.start, b.start));
-  refined = refined.filter((sp) => !timed.some((tp) => overlap(sp, tp) > 0.6 * (sp.end - sp.start)));
+  // When the recogniser heard a dictated command and ran on into your next
+  // sentence ("title edit out loud my last demo…"), split its phrase right
+  // after the command's own words, which Wispr gave us exactly.
+  const words = (/** @type {string} */ t) => t.toLowerCase().replace(/[^\p{L}\p{N}\s']/gu, ' ').split(/\s+/).filter(Boolean);
+  refined = refined.flatMap((sp) => {
+    const tp = timed.find((x) => Math.abs(x.start - sp.start) < 1.5);
+    if (!tp) return [sp];
+    const tw = words(tp.text), raw = sp.text.trim().split(/\s+/), sw = raw.map((w) => words(w)[0] || '');
+    if (raw.length <= tw.length + 1) return [sp];
+    const k = tw.length, same = tw.filter((w, i) => sw[i] === w || sw[i + 1] === w || sw[i - 1] === w).length;
+    if (same < Math.max(1, k * 0.6)) return [sp];
+    let from = tp.end;
+    for (let t = tp.end; t < sp.end; t += dt) if (on(t)) {
+      from = t;
+      break;
+    }
+    return [{ ...sp, text: raw.slice(0, k).join(' '), end: tp.end }, { ...sp, text: raw.slice(k).join(' '), start: from }];
+  });
+  // Then the general split of commands run together, for what Wispr didn't type.
+  refined = splitCommandRuns(refined, take.levels, threshold);
+  // The recogniser's version of a dictated command is dropped (Wispr's words
+  // are exact), but where it heard the voice start is kept: a pause inside the
+  // command ("point … skills and software") can hide its first word from the
+  // stretch of voice found above.
+  refined = refined.filter((sp) => {
+    const tp = timed.find((x) => overlap(sp, x) > 0.5 * (sp.end - sp.start));
+    if (!tp) return true;
+    if (sp.start < tp.start && tp.start - sp.start < 1.0) tp.start = sp.start;
+    return false;
+  });
   return [...refined, ...timed].sort((a, b) => a.start - b.start);
+}
+
+/** Words that open a labelled command ("slide: …", "point: …"). */
+const MARKERS = new Set(['slide', 'point', 'bullet', 'chapter', 'title', 'diapositiva', 'folie', 'punto', 'punkt', 'स्लाइड', 'पॉइंट']);
+const LEAD_FILLER = new Set(['ok', 'okay', 'so', 'and', 'now', 'next', 'new', 'a', 'right', 'alright', 'another']);
+
+/**
+ * Speech recognition runs commands said one after another into one phrase:
+ * "slide editing is a second job point hours of cutting point skills and
+ * software end slide", or "title edit out loud my last demo took…". Split
+ * such a phrase into one phrase per command (and the narration after it),
+ * at each marker word and at the first real pause once a label is said,
+ * timed by aligning the words to the voice.
+ * @param {Phrase[]} P @param {Levels} levels @param {number} threshold
+ * @returns {Phrase[]}
+ */
+export function splitCommandRuns(P, levels, threshold) {
+  /** @type {Phrase[]} */
+  const out = [];
+  let lastBoard = -Infinity; // when the last slide/point was said: a "point" soon after is a command
+  for (const p of P) {
+    const raw = p.text.normalize('NFC').replace(/\s+/g, ' ').trim().split(' ');
+    const norm = raw.map((w) => w.toLowerCase().replace(/[^\p{L}\p{N}']/gu, ''));
+    if (p.typed || raw.length < 3) {
+      out.push(p);
+      if (norm.some((w) => w === 'slide' || w === 'point' || w === 'bullet')) lastBoard = p.end;
+      continue;
+    }
+    const W = alignWords(p.text, p.start, p.end, levels, threshold);
+    const gap = (/** @type {number} */ i) => (i > 0 && W[i] && W[i - 1] ? W[i].start - W[i - 1].end : 0);
+    const isMarker = (/** @type {number} */ i) => MARKERS.has(norm[i]) || (norm[i] === 'end' && (norm[i + 1] === 'slide' || norm[i + 1] === 'the'));
+    let first = 0;
+    while (first < norm.length && LEAD_FILLER.has(norm[first])) first++;
+    let inRun = isMarker(first);
+    /** @type {number[]} */
+    const cuts = [];
+    for (let i = first + 1; i < norm.length; i++) {
+      const tail = norm.length - i;
+      if ((isMarker(i) && tail >= 2) || (norm[i] === 'end' && norm[i + 1] === 'slide')) {
+        const pausedBefore = gap(i) >= 0.3;
+        const boardWord = norm[i] === 'point' || norm[i] === 'bullet' || norm[i] === 'punto' || norm[i] === 'punkt';
+        const soonAfterBoard = p.start - lastBoard < 25;
+        if (inRun || (pausedBefore && (!boardWord || soonAfterBoard))) {
+          cuts.push(i);
+          inRun = true;
+        }
+      }
+    }
+    // The last label in a run ends at the first real pause after it: what
+    // follows is narration again ("title edit out loud | my last demo…").
+    if (inRun && levels.values.length) {
+      const since = cuts.length ? cuts[cuts.length - 1] : first;
+      if (norm[since] !== 'end' && since + 2 < norm.length) {
+        // The first pause of 0.35s+ in the voice after the label's first two words.
+        const mask = voiceMask(levels, threshold), dt = levels.dt;
+        const from = W[since + 1] ? W[since + 1].end : p.start;
+        for (let x = from; x < p.end; x += dt) {
+          if (voiced(mask, dt, x)) continue;
+          let q = x;
+          while (q < p.end && !voiced(mask, dt, q)) q += dt;
+          if (q - x >= 0.35 && q < p.end - 0.1) {
+            // Split the words where the share of syllables before the cut best
+            // matches the share of voice before the pause.
+            let vBefore = 0, vAll = 0;
+            for (let y = p.start; y < p.end; y += dt) if (voiced(mask, dt, y)) (vAll += dt), y < x && (vBefore += dt);
+            const syl = raw.map((w) => syllables(w) + 0.3);
+            const total = syl.reduce((a, b) => a + b, 0);
+            const f = vAll ? vBefore / vAll : 0.5;
+            let best = -1, bestErr = Infinity, acc = syl.slice(0, since + 2).reduce((a, b) => a + b, 0);
+            for (let i = since + 2; i < raw.length; i++) {
+              const err = Math.abs(acc / total - f);
+              if (err < bestErr) (bestErr = err), (best = i);
+              acc += syl[i];
+            }
+            if (best > since + 1) cuts.push(best);
+            break;
+          }
+          x = q;
+        }
+      }
+    }
+    if (!cuts.length) {
+      out.push(p);
+      if (inRun && norm.some((w) => w === 'slide' || w === 'point' || w === 'bullet')) lastBoard = p.end;
+      continue;
+    }
+    const bounds = [0, ...cuts, raw.length];
+    for (let k = 0; k + 1 < bounds.length; k++) {
+      const a = bounds[k], b = bounds[k + 1] - 1;
+      if (b < a) continue;
+      const text = raw.slice(a, b + 1).join(' ');
+      out.push({ text, start: W[a] ? W[a].start : p.start, end: W[b] ? W[b].end : p.end });
+      if (/^(?:slide|point|bullet)\b/i.test(text)) lastBoard = W[b] ? W[b].end : p.end;
+    }
+  }
+  return out;
 }
 
 /** Syllables in a whole phrase. @param {string} text */
@@ -574,8 +712,20 @@ export function buildPlan(take, options = {}) {
   // the recogniser's version of the same words, said a moment before.
   const parsed = parseCommands(P);
   const fromBox = parsed.filter((c) => P[c.phrase].typed);
+  /** Same command, judged by type and (for slides, points, titles) by its words. */
+  const sameCmd = (/** @type {Command} */ a, /** @type {Command} */ b) => {
+    if (a.type !== b.type) return false;
+    if (!LABELLED.has(a.type)) return true;
+    const wa = new Set((a.label || '').toLowerCase().split(/\W+/).filter(Boolean));
+    const wb = (b.label || '').toLowerCase().split(/\W+/).filter(Boolean);
+    const shared = wb.filter((w) => wa.has(w)).length;
+    return shared >= Math.max(1, Math.min(wa.size, wb.length) / 2);
+  };
+  const isDup = (/** @type {Command} */ c) => !P[c.phrase].typed && fromBox.some((d) => sameCmd(c, d) && Math.abs(P[d.phrase].start - P[c.phrase].start) < 4);
+  /** Phrases holding only a duplicate of a dictated command: silent, never captioned. */
+  const dupPhrases = new Set(parsed.filter(isDup).map((c) => c.phrase));
   const commands = parsed
-    .filter((c) => P[c.phrase].typed || !fromBox.some((d) => d.type === c.type && Math.abs(P[d.phrase].start - P[c.phrase].start) < 3))
+    .filter((c) => !isDup(c))
     .map((c) => {
     const cmd = { ...c, enabled: !disabled.has(c.id), effect: '' };
     // Switched on by hand in the editor: trust that over any guess below.
@@ -613,7 +763,7 @@ export function buildPlan(take, options = {}) {
   const live = commands.filter((c) => c.enabled);
   const nextOf = (/** @type {Command} */ c, /** @type {string[]} */ types) =>
     live.find((d) => d.phrase > c.phrase && types.includes(d.type));
-  const isCommandPhrase = (/** @type {number} */ i) => live.some((d) => d.phrase === i && d.standalone);
+  const isCommandPhrase = (/** @type {number} */ i) => dupPhrases.has(i) || live.some((d) => d.phrase === i && d.standalone);
   /** Narration phrases before index i, newest first. */
   const narrationBefore = (/** @type {number} */ i) => {
     const list = [];
@@ -625,6 +775,10 @@ export function buildPlan(take, options = {}) {
   const cuts = [];
   /** @type {{src0: number, src1: number, by: string, type: string, edge: boolean}[]} Spoken command ranges: cut or silenced in the final video. */
   const spoken = [];
+  for (const i of dupPhrases) {
+    if (live.some((d) => d.phrase === i)) continue;
+    spoken.push({ src0: clamp(P[i].start - 0.2), src1: clamp(P[i].end + 0.16), by: `dup-${i}`, type: 'dup', edge: false });
+  }
   /** @type {Speed[]} */
   let speeds = [];
   /** @type {View[]} */
@@ -652,7 +806,8 @@ export function buildPlan(take, options = {}) {
     // Generous margins: silencing costs nothing (the picture carries on), and
     // speech recognition's timing is never exact.
     if (c.standalone) {
-      spoken.push({ src0: clamp(p.start - 0.2), src1: clamp(p.end + 0.16), by: c.id, type: c.type, edge: true });
+      // Dictated commands are timed from the voice precisely: a tighter margin after them.
+      spoken.push({ src0: clamp(p.start - 0.2), src1: clamp(p.end + (p.typed ? 0.06 : 0.16)), by: c.id, type: c.type, edge: true });
     } else if (words.length) {
       // Inside a longer phrase: silence just the command's words, wherever they are.
       const t = cmdTimes(c);

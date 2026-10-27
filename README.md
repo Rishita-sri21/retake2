@@ -69,6 +69,9 @@ And without being asked:
 - **A stage** of animated scenes: the cost of editing, a cluttered traditional editor working itself into a frenzy, "Edit out loud", eight languages, Wispr Flow typing into Retake, and an end card. In the middle, a scripted tour of the **real Retake app**, in an iframe: the command list, the sample take, Final, Demo and Raw, the timeline, the Commands, Style and Export panels.
 - **A teleprompter** that floats over your windows: the current line, with commands highlighted, and what Retake just heard. Press → or Space (or a presentation clicker) for the next line.
 - **Retake records the Studio tab itself** with your camera, applies your spoken and Wispr-dictated commands live, and opens the take in the editor when you say "stop recording". Export the Demo version: one take, no editor.
+- **Only the stage is recorded.** Region Capture crops the recording to the 16:9 stage, so a laptop window of any shape gives a clean picture with no black bars, and the stage is centred at any size.
+- **Wispr Flow for every command.** An invisible command box keeps focus throughout, so you hold your Wispr key on each command line and Wispr types it straight into Retake. The teleprompter's status line shows whether Retake is hearing you and whether Wispr is ready.
+- **Recognition that can't silently die.** If Chrome's recogniser goes quiet while you're clearly talking, a watchdog restarts it within about 4 seconds.
 
 ## How it works
 
@@ -130,7 +133,9 @@ The plan is rebuilt from scratch whenever you flip a switch or change a setting,
 npm test
 ```
 
-50 tests on the command parser, motion analysis and planner, including:
+51 tests on the command parser, motion analysis and planner, including:
+
+- commands the recogniser ran together ("slide editing is a second job point hours of cutting point skills and software end slide", or a title running into the next sentence) are split apart at markers and pauses, and none of them is heard;
 
 - every direction in English, Hinglish and Devanagari Hindi;
 - ordinary narration ("this hides the sidebar", "the cut off date") is not mistaken for a direction;
