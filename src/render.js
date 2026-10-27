@@ -174,6 +174,8 @@ export function drawFrame(ctx, W, H, source, plan, src, out, rate, look, camera 
     ctx.restore();
   }
 
+  drawBoards(ctx, W, H, plan, src);
+
   // The screen layer is done: the player blends cut dissolves and motion
   // trails here, so the bubble and text above stay crisp and never double.
   onScene?.(ctx);
@@ -246,7 +248,7 @@ export function drawFrame(ctx, W, H, source, plan, src, out, rate, look, camera 
     ctx.restore();
   }
 
-  // Captions: the current line, each word lighting up as it's spoken.
+  // Captions: the current line.
   if (look.captions && !(plan.title && out < titleEnd - 0.25)) {
     const cap = plan.captions.find((c) => out >= c.out0 && out < c.out1);
     if (cap) {
@@ -265,16 +267,13 @@ export function drawFrame(ctx, W, H, source, plan, src, out, rate, look, camera 
       ctx.fillStyle = INK;
       roundRect(ctx, x, y, boxW, boxH, fs * 0.42);
       ctx.fill();
-      let wi = 0;
       lines.forEach((l, i) => {
         let at = (W - widths[i]) / 2;
         const by = y + fs * 0.31 + lh * (i + 0.76);
         for (const w of l.split(' ')) {
-          const said = !cap.words || out >= (cap.words[wi]?.out0 ?? 0) - 0.04;
-          ctx.fillStyle = said ? IVORY : 'rgba(244,241,234,0.5)';
+          ctx.fillStyle = IVORY;
           ctx.fillText(w, at, by);
           at += ctx.measureText(w).width + space;
-          wi++;
         }
       });
       ctx.restore();
@@ -387,6 +386,7 @@ export function camRect(mode, W, H, look, center = null) {
     return { x: (W - D) / 2, y: H * 0.18, d: D, a: 1 };
   }
   if (mode === 'hidden') return { x: x + d / 2, y: y + d / 2, d: 0, a: 0 };
+  if (mode === 'swap') return { x, y, d, a: 0 }; // the bubble holds the screen instead (drawSwap)
   return { x, y, d, a: 1 };
 }
 
@@ -404,6 +404,8 @@ export function pathCenter(plan, src, look) {
  */
 function drawCamera(ctx, W, H, cam, plan, src, look) {
   const { from, to, k } = cameraModeAt(plan, src);
+  const swapness = (from === 'swap' ? 1 - k : 0) + (to === 'swap' ? k : 0);
+  if (swapness > 0.001 && cam.width) drawSwap(ctx, W, H, cam, look, swapness, pathCenter(plan, src, look));
   const center = pathCenter(plan, src, look);
   const A = camRect(from, W, H, look, center), B = camRect(to, W, H, look, center);
   const r = { x: A.x + (B.x - A.x) * k, y: A.y + (B.y - A.y) * k, d: A.d + (B.d - A.d) * k, a: A.a + (B.a - A.a) * k };
@@ -456,6 +458,126 @@ function drawCamera(ctx, W, H, cam, plan, src, look) {
   }
   ctx.stroke();
   ctx.restore();
+}
+
+/** @type {HTMLCanvasElement | null} */
+let swapScratch = null;
+
+/**
+ * "Switch the screen": you fill the frame and the screen shrinks into a
+ * framed window where your bubble was. Eased by `k` (0..1).
+ * @param {CanvasRenderingContext2D} ctx @param {number} W @param {number} H
+ * @param {{frame: CanvasImageSource, width: number, height: number}} cam
+ * @param {Look} look @param {number} k @param {{x: number, y: number} | null} center
+ */
+function drawSwap(ctx, W, H, cam, look, k, center) {
+  // What's on the canvas now is the screen layer: keep a copy for the window.
+  const c = (swapScratch ||= document.createElement('canvas'));
+  if (c.width !== W || c.height !== H) (c.width = W), (c.height = H);
+  /** @type {CanvasRenderingContext2D} */ (c.getContext('2d')).drawImage(ctx.canvas, 0, 0);
+  const e = k * k * (3 - 2 * k);
+  // You, filling the frame (cover-crop, mirrored).
+  ctx.save();
+  ctx.globalAlpha = e;
+  const s = Math.max(W / cam.width, H / cam.height);
+  const dw = cam.width * s, dh = cam.height * s;
+  ctx.translate(W / 2 + dw / 2, (H - dh) / 2);
+  ctx.scale(-1, 1);
+  ctx.drawImage(cam.frame, 0, 0, dw, dh);
+  ctx.restore();
+  // The screen, in a window where the bubble sits.
+  const b = camRect('small', W, H, look, center);
+  const ww = b.d * 1.9, wh = ww * (H / W);
+  const cx = b.x + b.d / 2, cy = b.y + b.d / 2;
+  const x1 = Math.max(H * 0.03, Math.min(W - ww - H * 0.03, cx - ww / 2)), y1 = Math.max(H * 0.03, Math.min(H - wh - H * 0.03, cy - wh / 2));
+  // Grows out of the full frame into the window.
+  const x = x1 * e, y = y1 * e, w = W + (ww - W) * e, h = H + (wh - H) * e;
+  ctx.save();
+  ctx.shadowColor = 'rgba(0,0,0,0.5)';
+  ctx.shadowBlur = H * 0.04 * e;
+  roundRect(ctx, x, y, w, h, H * 0.018 * e);
+  ctx.fillStyle = '#000';
+  ctx.fill();
+  ctx.shadowColor = 'transparent';
+  ctx.clip();
+  ctx.drawImage(c, x, y, w, h);
+  ctx.restore();
+  ctx.save();
+  ctx.globalAlpha = e;
+  roundRect(ctx, x, y, w, h, H * 0.018 * e);
+  ctx.lineWidth = Math.max(2, H * 0.004);
+  ctx.strokeStyle = 'rgba(244,241,234,0.85)';
+  ctx.stroke();
+  ctx.restore();
+}
+
+/**
+ * Slides and points said into being: a full-screen slide (title + bullets),
+ * or a card of points over the screen. Each bullet slides in as you say it.
+ * @param {CanvasRenderingContext2D} ctx @param {number} W @param {number} H @param {Plan} plan @param {number} src
+ */
+function drawBoards(ctx, W, H, plan, src) {
+  for (const b of plan.boards || []) {
+    if (src < b.src0 || src >= b.src1) continue;
+    const kIn = Math.min(1, (src - b.src0) / 0.45), kOut = Math.min(1, (b.src1 - src) / 0.4);
+    const a = Math.max(0, Math.min(kIn, kOut));
+    const ease = (/** @type {number} */ x) => 1 - Math.pow(1 - x, 3);
+    const items = b.items.filter((it) => src >= it.src);
+    ctx.save();
+    if (b.full) {
+      ctx.globalAlpha = a;
+      const g = ctx.createRadialGradient(W * 0.82, H * 0.1, 0, W * 0.82, H * 0.1, W * 0.75);
+      g.addColorStop(0, '#2a2420');
+      g.addColorStop(1, '#0e0e11');
+      ctx.fillStyle = g;
+      ctx.fillRect(0, 0, W, H);
+      const left = W * 0.085, top = H * 0.2;
+      const fs = Math.round(H * 0.082);
+      ctx.font = `400 ${fs}px ${FONT_DISPLAY}`;
+      ctx.fillStyle = IVORY;
+      const lines = wrapLines(ctx, b.title || '', W * 0.7).slice(0, 2);
+      const rise = (1 - ease(kIn)) * H * 0.02;
+      lines.forEach((l, i) => ctx.fillText(l, left, top + rise + fs * (0.85 + i * 1.02)));
+      const ruleY = top + fs * (0.85 + (lines.length - 1) * 1.02) + fs * 0.45;
+      ctx.fillStyle = CHAMPAGNE;
+      ctx.fillRect(left, ruleY, W * 0.06 * ease(kIn), Math.max(2, H * 0.004));
+      const bs = Math.round(H * 0.042), lh = bs * 1.85;
+      ctx.font = `400 ${bs}px ${FONT_BODY}`;
+      items.forEach((it, i) => {
+        const k = ease(Math.min(1, (src - it.src) / 0.4));
+        const y = ruleY + bs * 1.9 + i * lh;
+        ctx.globalAlpha = a * k;
+        ctx.fillStyle = CHAMPAGNE;
+        ctx.beginPath();
+        ctx.arc(left + bs * 0.25 - (1 - k) * bs, y - bs * 0.33, bs * 0.14, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillStyle = IVORY;
+        ctx.fillText(wrapLines(ctx, it.text, W * 0.62)[0] || '', left + bs * 0.9 - (1 - k) * bs, y);
+      });
+    } else if (items.length) {
+      const bs = Math.round(H * 0.034), lh = bs * 1.7, pad = bs * 0.9;
+      ctx.font = `500 ${bs}px ${FONT_BODY}`;
+      const width = Math.min(W * 0.46, Math.max(...items.map((it) => ctx.measureText(it.text).width)) + bs * 1.2 + pad * 2);
+      const height = pad * 1.6 + items.length * lh - (lh - bs);
+      const x = H * 0.05, y = H * 0.07;
+      ctx.globalAlpha = a;
+      ctx.fillStyle = INK;
+      roundRect(ctx, x, y, width, height, bs * 0.5);
+      ctx.fill();
+      items.forEach((it, i) => {
+        const k = ease(Math.min(1, (src - it.src) / 0.35));
+        const ty = y + pad * 0.8 + bs * 0.85 + i * lh;
+        ctx.globalAlpha = a * k;
+        ctx.fillStyle = CHAMPAGNE;
+        ctx.beginPath();
+        ctx.arc(x + pad + bs * 0.2, ty - bs * 0.32, bs * 0.13, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillStyle = IVORY;
+        ctx.fillText(wrapLines(ctx, it.text, width - pad * 2 - bs)[0] || '', x + pad + bs * 0.75 + (1 - k) * bs * 0.6, ty);
+      });
+    }
+    ctx.restore();
+  }
 }
 
 /** @param {CanvasRenderingContext2D} ctx @param {number} x @param {number} y @param {number} w @param {number} h @param {number} r */

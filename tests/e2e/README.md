@@ -14,3 +14,13 @@ python3 leak.py out/raw.mp4 out/final.mp4 out/demo.mp4
 ```
 
 Needs Python 3 with numpy and Playwright, ffmpeg, and the `libflite` libraries.
+
+## The Studio script, end to end
+
+```bash
+python3 make_studio_audio.py            # speaks the whole script in src/studio.js
+mkdir -p studio && python3 run_studio.py studio
+python3 leak.py studio/final.mp4 studio/demo.mp4
+```
+
+It records the Studio tab with the narration as the microphone, presses → at each beat, types the two Wispr lines into the command box (the recogniser mishears one of them), stops by voice, and exports both versions. `studio/plan.json` lists what Retake did with every command.

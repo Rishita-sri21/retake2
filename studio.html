@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Retake Studio</title>
+  <meta name="description" content="Retake Studio: the stage, teleprompter and recorder for Retake's demo video.">
+  <meta name="theme-color" content="#0e0e10">
+  <link rel="icon" href="assets/icon.svg" type="image/svg+xml">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Instrument+Sans:ital,wght@0,400..700;1,400..700&family=Geist+Mono:wght@400;500&display=swap">
+  <link rel="stylesheet" href="studio.css">
+  <script type="module" src="src/studio.js"></script>
+</head>
+<body>
+  <!-- The stage: 1920×1080, scaled to the window. Everything on it is what the video shows. -->
+  <div class="viewport" id="viewport">
+    <div class="stage" id="stage">
+
+      <!-- 1 · Hook: the cost of editing -->
+      <section class="scene" data-scene="hook">
+        <p class="hk-label">My last demo video</p>
+        <div class="hk-row"><span class="hk-name">Recording</span><span class="hk-time" id="hk-rec">00:04:00</span></div>
+        <div class="hk-row hk-edit"><span class="hk-name">Editing</span><span class="hk-time" id="hk-edit">00:00:00</span></div>
+        <div class="hk-bar"><i id="hk-bar-rec"></i><i id="hk-bar-edit"></i></div>
+      </section>
+
+      <!-- 2 · The grind: a cluttered, traditional video editor -->
+      <section class="scene" data-scene="nle">
+        <div class="nle">
+          <header class="nle-top"><b>CutStudio Pro</b><span>demo_final_v7_REAL_final.cspro</span><nav>File Edit Clip Sequence Markers Graphics Effects View Window Help</nav></header>
+          <div class="nle-bin">
+            <p>Project</p>
+            <ul><li>take_01.mov</li><li>take_02.mov</li><li>take_02_fix.mov</li><li>take_03_FINAL.mov</li><li>zoom_insert.mov</li><li>blur_mask_v4</li><li>captions_EN.srt</li><li>music_bed.wav</li></ul>
+          </div>
+          <div class="nle-viewer">
+            <div class="nle-screen">
+              <pre class="nle-code">const city = 'Mumbai'
+const days = await fetchForecast(city)
+<span class="nle-secret">password: hunter2-prod-7731</span>
+drawChart(canvas, days)</pre>
+              <i class="nle-mask" id="nle-mask"></i>
+              <i class="nle-zoombox" id="nle-zoombox"></i>
+            </div>
+            <div class="nle-transport"><span id="nle-frame">00:01:12:04</span><span>Fit ▾</span><span>Full ▾</span></div>
+          </div>
+          <div class="nle-fx">
+            <p>Effect Controls</p>
+            <div class="fx-row"><span>Scale</span><b id="fx-scale"></b></div>
+            <div class="fx-row"><span>Position</span><b id="fx-pos"></b></div>
+            <div class="fx-row"><span>Mask Path</span><b id="fx-mask"></b></div>
+            <div class="fx-row"><span>Opacity</span><b id="fx-op"></b></div>
+            <div class="fx-caption"><span>Caption 14</span><em id="fx-cap"></em></div>
+          </div>
+          <div class="nle-timeline" id="nle-timeline">
+            <div class="tl-ruler"></div>
+            <div class="tl-track"><span>V2</span><div class="tl-lane" id="lane-v2"></div></div>
+            <div class="tl-track"><span>V1</span><div class="tl-lane" id="lane-v1"></div></div>
+            <div class="tl-track"><span>A1</span><div class="tl-lane" id="lane-a1"></div></div>
+            <div class="tl-track"><span>CC</span><div class="tl-lane" id="lane-cc"></div></div>
+            <i class="tl-head" id="tl-head"></i>
+          </div>
+          <footer class="nle-stats"><span>Clicks <b id="st-clicks">0</b></span><span>Undos <b id="st-undo">0</b></span><span>Keyframes <b id="st-keys">0</b></span><span>Tutorials watched <b id="st-tut">0</b></span><span class="st-time">Time editing <b id="st-time">02:51:07</b></span></footer>
+        </div>
+      </section>
+
+      <!-- 3 · The turn -->
+      <section class="scene" data-scene="turn">
+        <p class="tn-eyebrow">Introducing Retake</p>
+        <h1 class="tn-title">Edit <em>out loud.</em></h1>
+        <p class="tn-sub">A screen recorder that takes direction.</p>
+      </section>
+
+      <!-- 4 · The real app, in a browser window -->
+      <section class="scene" data-scene="app">
+        <div class="browser">
+          <div class="browser-bar"><i></i><i></i><i></i><span id="browser-url">retake · edit out loud</span></div>
+          <iframe id="app" title="Retake" src="./?embed"></iframe>
+        </div>
+        <div class="env-card" id="env-card" hidden>
+          <div class="env-tab">.env</div>
+          <pre><span class="c"># payments</span>
+STRIPE_KEY=<span id="env-key"></span></pre>
+        </div>
+      </section>
+
+      <!-- 5 · Any language -->
+      <section class="scene" data-scene="lang">
+        <p class="lg-eyebrow">Same command, eight languages</p>
+        <div class="board" id="board"></div>
+        <p class="lg-sub">English · Hinglish · हिन्दी · Español · Français · Deutsch · Português · Italiano</p>
+      </section>
+
+      <!-- 6 · Wispr Flow types commands straight into Retake -->
+      <section class="scene" data-scene="wispr">
+        <p class="ws-eyebrow">Wispr Flow <span>→</span> Retake</p>
+        <h2 class="ws-title">Hold a key. Say the command.<br><em>Wispr types it straight into Retake.</em></h2>
+        <form class="ws-box" id="ws-form" autocomplete="off">
+          <label for="ws-input">Retake command box</label>
+          <input id="ws-input" type="text" placeholder="Hold your Wispr Flow key and speak…" spellcheck="false">
+          <p class="ws-done" id="ws-done"></p>
+        </form>
+        <p class="ws-built">Retake itself was built the same way: by talking to the code.</p>
+      </section>
+
+      <!-- 7 · Close -->
+      <section class="scene" data-scene="end">
+        <div class="end-mark"><svg viewBox="0 0 32 32" aria-hidden="true"><circle cx="16" cy="16" r="14.5" fill="none" stroke="#e8c9a0" stroke-width="1.2"/><circle cx="16" cy="16" r="5" fill="#e5534b"/></svg></div>
+        <h1 class="end-title">Retake</h1>
+        <p class="end-tag">Stop editing. <em>Start talking.</em></p>
+        <p class="end-url" id="end-url"></p>
+        <p class="end-by">Made by Rishita Srivastava · built with Wispr Flow for No Hands</p>
+      </section>
+
+      <svg class="cursor" id="cursor" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 2l16 9-7 1.6L10 20z" fill="#fff" stroke="#111" stroke-width="1.4" stroke-linejoin="round"/></svg>
+      <i class="click-ring" id="click-ring"></i>
+    </div>
+  </div>
+
+  <!-- Set-up panel: shown before recording, gone once the take starts. -->
+  <aside class="setup" id="setup">
+    <h1>Retake <em>Studio</em></h1>
+    <p>Everything for the demo video: the stage, a teleprompter that floats over your windows, and Retake recording this tab with your camera.</p>
+    <ol>
+      <li>Make this window full screen (<kbd>F11</kbd>, or the button below).</li>
+      <li>Open the teleprompter and put it just under your webcam.</li>
+      <li>Press <b>Start recording</b> and choose <b>this tab</b>.</li>
+      <li>Read each line. Press <kbd>→</kbd> or <kbd>Space</kbd> (or a presentation clicker) for the next one. <kbd>←</kbd> goes back.</li>
+    </ol>
+    <div class="setup-row">
+      <label>I’ll be speaking
+        <select id="lang">
+          <option value="en-IN">English (India)</option>
+          <option value="en-US">English (US)</option>
+          <option value="en-GB">English (UK)</option>
+        </select>
+      </label>
+    </div>
+    <div class="setup-actions">
+      <button type="button" id="btn-full">Full screen</button>
+      <button type="button" id="btn-prompter">Open teleprompter</button>
+      <button type="button" id="btn-rehearse">Rehearse (no recording)</button>
+      <button type="button" class="primary" id="btn-record">Start recording</button>
+    </div>
+    <p class="setup-note" id="setup-note"></p>
+  </aside>
+</body>
+</html>

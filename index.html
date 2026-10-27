@@ -69,6 +69,10 @@
           <h2 id="vocab-title">What you can say</h2>
           <p>Say these while you record, in English, Hinglish, Hindi, Spanish, French, German, Portuguese or Italian. Everything else you say becomes captions.</p>
         </div>
+        <aside class="wispr-note">
+          <h3>Direct with <em>Wispr Flow</em></h3>
+          <p>Retake listens to every word, but browser speech recognition can mishear a command. For the ones that must land exactly, click the <b>command box</b> on the recording slate (it also floats with your camera), hold your Wispr Flow key and say the command. Wispr types it perfectly, Retake times it from your voice, and the command is silenced in the final video like any other.</p>
+        </aside>
         <div class="vocab-groups" id="vocab"></div>
         <div class="auto">
           <h3>And without being asked</h3>
@@ -103,13 +107,17 @@
             <p class="hud-interim" id="hud-interim"></p>
           </div>
         </div>
+        <form class="director" id="director-form" autocomplete="off">
+          <label for="director">Command box <span>· click here, hold your Wispr Flow key and say the command, or type it</span></label>
+          <input id="director" type="text" placeholder="zoom in on the top right" spellcheck="false">
+        </form>
         <ol class="hud-log" id="hud-log"></ol>
         <div class="hud-actions">
           <button class="btn primary" id="stop" type="button"><span class="square" aria-hidden="true"></span>Stop and edit</button>
           <button class="btn soft" id="pause" type="button">Pause</button>
           <button class="btn soft" id="pop-out" type="button">Float my camera</button>
         </div>
-        <p class="hud-tip">Say <b>“pause”</b>, <b>“resume”</b> or <b>“stop recording”</b> any time. <b>Float my camera</b> puts just your bubble above every window; drag it anywhere. If you’re sharing your whole screen, the bubble in the final video follows it.</p>
+        <p class="hud-tip">Say <b>“pause”</b>, <b>“resume”</b> or <b>“stop recording”</b> any time. For commands that must land exactly, dictate them into the command box with <b>Wispr Flow</b>: it also floats with your camera. <b>Float my camera</b> puts just your bubble above every window; drag it anywhere. If you’re sharing your whole screen, the bubble in the final video follows it.</p>
       </div>
     </section>
 
@@ -157,6 +165,7 @@
               <li><i class="k blur"></i>Hidden</li>
               <li><i class="k spot"></i>Spotlight</li>
               <li><i class="k cam"></i>Big camera</li>
+              <li><i class="k slide"></i>Slide</li>
               <li><i class="k mute"></i>Silenced</li>
               <li><i class="k chap"></i>Chapter</li>
             </ul>
@@ -240,6 +249,7 @@
                 <button class="btn soft small" id="dl-srt" type="button">Captions .srt</button>
                 <button class="btn soft small" id="dl-vtt" type="button">Captions .vtt</button>
                 <button class="btn soft small" id="dl-txt" type="button">Transcript .txt</button>
+                <button class="btn soft small" id="dl-take" type="button" title="Timing data for this take (what was heard, voice levels), to share if something was cut or captioned at the wrong moment">Timing data</button>
               </div>
               <label class="ytc"><span>YouTube chapters</span><textarea id="yt-chapters" rows="5" readonly></textarea></label>
               <p class="small-print" id="yt-note"></p>

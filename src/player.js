@@ -333,10 +333,16 @@ export class Player {
     if (source.blob) this.audio();
   }
 
+  /** Silence everything (used when Retake is shown inside Retake Studio). */
+  mute() {
+    this.muted = true;
+    if (this.gain && this.actx) this.gain.gain.setValueAtTime(0, this.actx.currentTime);
+  }
+
   /** Route the video's sound through Web Audio (needed for export, fades and fast-forward muting). */
   audio() {
     const els = this.source.elements?.() ?? (this.source.video ? [this.source.video] : []);
-    if (!els.length || this.gain) return this.gain;
+    if ((!els.length && !this.source.blob) || this.gain) return this.gain;
     const AC = window.AudioContext || /** @type {any} */ (window).webkitAudioContext;
     this.actx = new AC();
     this.gain = this.actx.createGain();
@@ -347,6 +353,7 @@ export class Player {
       node.connect(g).connect(this.gain);
       this.elemGains.set(el, g);
     }
+    if (this.muted) this.gain.gain.value = 0;
     this.gain.connect(this.actx.destination);
     this.dest = this.actx.createMediaStreamDestination();
     this.gain.connect(this.dest);
@@ -361,7 +368,7 @@ export class Player {
           this.buffer = buf;
           // From now on the elements are silent; the buffer carries the sound.
           for (const g of this.elemGains.values()) g.gain.setValueAtTime(0, actx.currentTime);
-          this.gain?.gain.setValueAtTime(1, actx.currentTime);
+          this.gain?.gain.setValueAtTime(this.muted ? 0 : 1, actx.currentTime);
           if (this.playing && !this.busy) this.startVoice(this.source.time());
         })
         .catch(() => {});
@@ -634,7 +641,7 @@ export class Player {
   /** Smoothly move the volume, avoiding clicks. @param {number} to @param {number} tc */
   ramp(to, tc) {
     // With decoded sound the master stays open; each stretch has its own envelope.
-    if (!this.gain || !this.actx || this.buffer) return;
+    if (!this.gain || !this.actx || this.buffer || this.muted) return;
     const g = this.gain.gain;
     const now = this.actx.currentTime;
     g.cancelScheduledValues(now);

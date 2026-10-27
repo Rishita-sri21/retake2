@@ -4,3 +4,6 @@ node_modules/
 tests/e2e/*.wav
 tests/e2e/timeline.json
 tests/e2e/out/
+tests/e2e/studio*/
+tests/e2e/seg.wav
+tests/e2e/studio_timeline.json

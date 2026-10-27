@@ -19,14 +19,15 @@
  * rebuilt from scratch whenever a setting or a command toggle changes, so
  * every edit is non-destructive.
  */
-import { parseCommands } from './commands.js';
+import { parseCommands, LABELLED } from './commands.js';
 import { focusAt, secretAt, goneAt, activity } from './motion.js';
 
 /** @typedef {import('./commands.js').Phrase} Phrase */
 /** @typedef {import('./commands.js').Command} Command */
 /** @typedef {import('./motion.js').MotionSample} MotionSample */
 /** @typedef {import('./motion.js').Box} Box */
-/** @typedef {'small'|'big'|'hidden'} CamMode */
+/** @typedef {'small'|'big'|'hidden'|'swap'} CamMode */
+/** @typedef {{src0: number, src1: number, title: string | null, full: boolean, items: {src: number, text: string, by: string}[], by: string}} Board  A slide (full) or a list of points over the screen. */
 /** @typedef {{dt: number, values: ArrayLike<number>}} Levels */
 
 /**
@@ -71,6 +72,8 @@ export const DEFAULTS = {
   fumbleRate: 1,
 };
 
+/** How long "hide that" blurs when nothing else says when to stop. */
+export const HIDE_DEFAULT = 6;
 /** Playback faster than this is silent (fast-forward); slower keeps the voice. */
 export const AUDIBLE_RATE = 1.3;
 /** Output seconds a zoom takes to glide. */
@@ -218,7 +221,12 @@ export function refinePhrases(take, threshold) {
     // voice that follows is when the recogniser heard the next phrase begin.
     const next = take.phrases[i + 1];
     const nextFrom = next ? next.start - 0.9 : Infinity;
-    const need = 0.8 * Math.max(0.3, sentenceSyllables(p.text) / 5.5);
+    const syl = sentenceSyllables(p.text);
+    const need = 0.8 * Math.max(0.3, syl / 5.5);
+    // Even slow speech says this many syllables within maxDur: voice that
+    // resumes after that belongs to the next phrase, however late the
+    // recogniser reported it.
+    const maxDur = syl / 2.6 + 0.5;
     let voicedFor = 0;
     for (let t = start; t < Math.min(end, take.duration); ) {
       if (at(t)) {
@@ -229,15 +237,85 @@ export function refinePhrases(take, threshold) {
       const gap = t;
       while (t < end && !at(t)) t += dt;
       if (t >= end) break; // the voice just stopped: the walk-back was right
-      if (voicedFor >= need && t >= nextFrom) {
+      if (voicedFor >= need && (t >= nextFrom || t - start > maxDur)) {
         end = gap + 0.06;
         break;
       }
     }
     if (end <= start + 0.2) end = Math.max(p.end, start + 0.4);
+    // A short phrase (a command) can't run on for seconds: cap it, ending at
+    // the last pause inside the cap if there is one.
+    if (syl <= 8 && end - start > maxDur * 1.25) {
+      // The quietest moment before the cap (raw loudness: the voice mask
+      // bridges short pauses), preferring the latest truly quiet one.
+      const cap = start + maxDur * 1.25;
+      const vals = lv.values;
+      let best = -1, bestV = Infinity;
+      for (let i = Math.floor(cap / dt); i * dt > start + 0.3; i--) {
+        const x = vals[i] ?? 0;
+        if (x < threshold * 0.5) {
+          best = i;
+          break;
+        }
+        if (x < bestV) (bestV = x), (best = i);
+      }
+      end = best >= 0 ? best * dt + 0.02 : cap;
+    }
     out.push({ text: p.text, start, end: Math.min(take.duration, end) });
   });
   return out;
+}
+
+/**
+ * Every phrase with its real timing: speech-recognised phrases refined from
+ * the mic, and command-box phrases (typed, or dictated with Wispr Flow) placed
+ * on the stretch of voice that ended just before the text arrived. The
+ * recogniser's own (often wrong) version of a dictated command is dropped.
+ * @param {Take} take @param {number} threshold
+ * @returns {Phrase[]}
+ */
+export function phrasesOf(take, threshold) {
+  const speech = take.phrases.filter((p) => !p.typed);
+  const box = take.phrases.filter((p) => p.typed);
+  if (!box.length) return refinePhrases(take, threshold);
+  let refined = refinePhrases({ ...take, phrases: speech }, threshold);
+  const lv = take.levels, dt = lv.dt;
+  const mask = lv.values.length ? voiceMask(lv, threshold) : null;
+  const on = (/** @type {number} */ t) => Boolean(mask && voiced(mask, dt, t));
+  const timed = box.map((p) => {
+    // Wispr types the words when you let go of its key: the voice ended up to
+    // ~2.5s before. Voice still going when the text arrived, or begun only just
+    // before, can't be what was dictated: you've moved on to your next sentence.
+    let from = p.end + 0.05;
+    for (let tries = 0; tries < 4; tries++) {
+      let end = -1;
+      for (let t = from; t >= Math.max(0, p.end - 3); t -= dt) if (on(t)) {
+        end = t + dt;
+        break;
+      }
+      if (end < 0) break;
+      let start = end - dt;
+      // Back through the words, across the short pauses inside a command, up to 4s.
+      for (let t = start; t >= Math.max(0, end - 4); t -= dt) {
+        if (on(t)) start = t;
+        else {
+          let gap = 0;
+          while (gap < 0.3 && !on(t - gap) && t - gap > 0) gap += dt;
+          if (gap >= 0.3) break;
+        }
+      }
+      // Still talking when the text arrived, or only just started: that's your next sentence.
+      if (end >= p.end - 0.02 || start > p.end - 0.35) {
+        from = start - dt;
+        continue;
+      }
+      return { ...p, start: Math.max(0, start - 0.04), end: Math.min(end + 0.04, p.end) };
+    }
+    return { ...p, start: Math.max(0, p.end - 0.3), end: p.end }; // typed by hand: no voice to find
+  });
+  const overlap = (/** @type {Phrase} */ a, /** @type {Phrase} */ b) => Math.max(0, Math.min(a.end, b.end) - Math.max(a.start, b.start));
+  refined = refined.filter((sp) => !timed.some((tp) => overlap(sp, tp) > 0.6 * (sp.end - sp.start)));
+  return [...refined, ...timed].sort((a, b) => a.start - b.start);
 }
 
 /** Syllables in a whole phrase. @param {string} text */
@@ -400,7 +478,7 @@ export function buildPlan(take, options = {}) {
   const D = take.duration;
   const clamp = (/** @type {number} */ t) => Math.max(0, Math.min(D, t));
   const disabled = new Set(o.disabled);
-  const P = refinePhrases(take, o.levelThreshold);
+  const P = phrasesOf(take, o.levelThreshold);
   const W = P.map((p) => alignWords(p.text, p.start, p.end, take.levels, o.levelThreshold));
   const joins = take.joins || [];
   const hasLevels = take.levels.values.length > 0;
@@ -469,6 +547,22 @@ export function buildPlan(take, options = {}) {
     }
     return best;
   };
+  /**
+   * Where the sentence you just fumbled began, inside a stretch of speech
+   * [a, b]: the whole stretch if it's under 4s, otherwise from its last real
+   * pause (half a second or more) that leaves at least 1.5s to cut. Speech
+   * recognition often hands over several sentences as one phrase, and
+   * "scratch that" means the last of them.
+   */
+  const lastStretch = (/** @type {number} */ a, /** @type {number} */ b) => {
+    if (!hasLevels || b - a < 4) return a;
+    for (let x = b - 1.5; x > a + 1; x -= ldt) {
+      let q = 0;
+      while (x - q * ldt > a && !voiced(mask, ldt, x - q * ldt) && take.levels.values[Math.floor((x - q * ldt) / ldt)] < o.levelThreshold * 0.6) q++;
+      if (q * ldt >= 0.5) return x;
+    }
+    return a;
+  };
   /** Is there a pause just before (or after) t? */
   const pauseNear = (/** @type {number} */ t, /** @type {'before'|'after'} */ side) => {
     if (!hasLevels) return true;
@@ -476,7 +570,13 @@ export function buildPlan(take, options = {}) {
     for (let x = a; x <= b; x += ldt) if (quietAt(x)) return true;
     return false;
   };
-  const commands = parseCommands(P).map((c) => {
+  // A command that came in through the command box (Wispr Flow) wins over
+  // the recogniser's version of the same words, said a moment before.
+  const parsed = parseCommands(P);
+  const fromBox = parsed.filter((c) => P[c.phrase].typed);
+  const commands = parsed
+    .filter((c) => P[c.phrase].typed || !fromBox.some((d) => d.type === c.type && Math.abs(P[d.phrase].start - P[c.phrase].start) < 3))
+    .map((c) => {
     const cmd = { ...c, enabled: !disabled.has(c.id), effect: '' };
     // Switched on by hand in the editor: trust that over any guess below.
     const forced = disabled.has(`on:${c.id}`);
@@ -498,7 +598,7 @@ export function buildPlan(take, options = {}) {
   // narration after it between the command and the phrase end. (Spreading the
   // whole phrase evenly would let a slow fumble push words across the command.)
   for (const c of commands) {
-    if (c.standalone || !c.enabled || c.type === 'chapter' || c.type === 'title') continue;
+    if (c.standalone || !c.enabled || LABELLED.has(c.type)) continue;
     const w = W[c.phrase], p = P[c.phrase];
     if (!w.length) continue;
     const t = cmdTimes(c);
@@ -538,6 +638,12 @@ export function buildPlan(take, options = {}) {
   /** @type {{src: number, by: string}[]} */
   const markSrc = [];
   let title = /** @type {string|null} */ (null);
+  /** @type {Board[]} */
+  const boards = [];
+  /** End whatever slide or list of points is showing. @param {number} at @param {boolean} all */
+  const closeBoards = (at, _all) => {
+    for (const b of boards) if (b.src1 === Infinity) b.src1 = clamp(Math.max(b.src0 + 0.5, at));
+  };
   /** @type {{src: number, mode: CamMode, by?: string}[]} */
   const camera = [{ src: 0, mode: o.cameraStart || take.cameraStart || 'small' }];
 
@@ -564,9 +670,10 @@ export function buildPlan(take, options = {}) {
         // The fumble is in this breath if you said enough before "scratch that",
         // otherwise it's the sentence before.
         const prev = narrationBefore(c.phrase)[0];
-        const from = c.before >= 3 || prev === undefined ? p.start : P[prev].start;
+        const sameBreath = c.before >= 3 || prev === undefined;
+        const from = sameBreath ? lastStretch(p.start, t.start) : lastStretch(P[prev].start, P[prev].end);
         // Up to the end of "scratch that" itself: a retake said in the same breath stays.
-        cuts.push({ src0: clamp(from - 0.06), src1: clamp(t.end + 0.1), reason: 'fumble', by: c.id });
+        cuts.push({ src0: clamp(from - 0.06), src1: clamp(t.end + 0.04), reason: 'fumble', by: c.id });
         c.effect = `Removed ${(t.end - from).toFixed(1)}s`;
         break;
       }
@@ -574,13 +681,13 @@ export function buildPlan(take, options = {}) {
         const list = narrationBefore(c.phrase);
         const n = Math.max(1, Math.min(list.length, Math.round(c.count || 1)));
         const from = list.length ? P[list[n - 1]].start : p.start;
-        cuts.push({ src0: clamp(from - 0.06), src1: clamp(t.end + 0.1), reason: 'cut', by: c.id });
+        cuts.push({ src0: clamp(from - 0.06), src1: clamp(t.end + 0.04), reason: 'cut', by: c.id });
         c.effect = `Removed ${n} sentence${n > 1 ? 's' : ''} (${(t.end - from).toFixed(1)}s)`;
         break;
       }
       case 'cutSeconds': {
         const from = clamp(t.start - (c.seconds || 5));
-        cuts.push({ src0: from, src1: clamp(t.end + 0.1), reason: 'cut', by: c.id });
+        cuts.push({ src0: from, src1: clamp(t.end + 0.04), reason: 'cut', by: c.id });
         c.effect = `Removed ${(t.end - from).toFixed(1)}s`;
         break;
       }
@@ -595,7 +702,7 @@ export function buildPlan(take, options = {}) {
         c.effect = live.some((d) => d.type === 'cutFrom' && d.phrase < c.phrase) ? 'End of the cut' : 'No “cut from here” before this';
         break;
       case 'stop':
-        cuts.push({ src0: clamp(Math.min(p.start, t.start) - 0.08), src1: D, reason: 'stop', by: c.id });
+        cuts.push({ src0: clamp(Math.min(p.start, t.start) - 0.25), src1: D, reason: 'stop', by: c.id });
         c.effect = 'The video ends here';
         break;
       case 'pause': {
@@ -647,12 +754,17 @@ export function buildPlan(take, options = {}) {
       case 'hide': {
         const secret = secretAt(take.motion, t.start + 0.4);
         if (secret) {
+          // Ends, in order of preference: a time you gave, "show it" (said in
+          // the next 30s, before any other "hide that"), the moment the
+          // secret left the screen (within 30s), else 6 seconds after you asked.
+          const nextHide = nextOf(c, ['hide']);
           const un = nextOf(c, ['unhide']);
+          const unOk = un && P[un.phrase].start - t.end < 30 && (!nextHide || un.phrase < nextHide.phrase);
           const gone = goneAt(take.motion, secret.box, t.start + 0.4);
-          let end = D, why = 'to the end';
+          let end = t.end + HIDE_DEFAULT, why = `for ${HIDE_DEFAULT}s (say “show it” to end it sooner, or “hide that for 20 seconds”)`;
           if (c.seconds) [end, why] = [t.end + c.seconds, `for ${c.seconds}s`];
-          else if (un) [end, why] = [P[un.phrase].end, `until you said “${un.heard}”`];
-          else if (gone !== null) [end, why] = [gone + 0.1, 'until it left the screen'];
+          else if (unOk) [end, why] = [cmdTimes(un).start, `until you said “${un.heard}”`];
+          else if (gone !== null && gone - t.end < 30) [end, why] = [Math.max(gone + 0.1, t.end + 1), 'until it left the screen'];
           blurs.push({ src0: secret.start, src1: clamp(end), box: secret.box, by: c.id });
           c.effect = `Blurred from ${fmt(secret.start)} ${why}`;
         } else c.effect = 'Nothing new appeared on screen to hide';
@@ -663,15 +775,17 @@ export function buildPlan(take, options = {}) {
         break;
       case 'hideScreen': {
         const show = nextOf(c, ['showScreen']);
-        const end = c.seconds ? t.end + c.seconds : show ? P[show.phrase].start : D;
+        const showOk = show && P[show.phrase].start - t.end < 180;
+        const end = c.seconds ? t.end + c.seconds : showOk ? cmdTimes(show).start : t.end + 20;
         blurs.push({ src0: clamp(t.start - 0.1), src1: clamp(end), box: { x: 0, y: 0, w: 1, h: 1 }, full: true, by: c.id });
-        c.effect = c.seconds ? `Whole screen hidden for ${c.seconds}s` : show ? `Whole screen hidden until “${show.heard}”` : 'Whole screen hidden to the end';
+        c.effect = c.seconds ? `Whole screen hidden for ${c.seconds}s` : showOk ? `Whole screen hidden until “${show.heard}”` : 'Whole screen hidden for 20s (say “show the screen” to end it)';
         break;
       }
       case 'showScreen':
         c.effect = 'Ends the screen blur';
         break;
       case 'chapter':
+        closeBoards(t.start, false);
         chapterSrc.push({ src: p.start, title: c.label || 'Chapter', by: c.id });
         c.effect = `Chapter “${c.label}”`;
         break;
@@ -689,16 +803,45 @@ export function buildPlan(take, options = {}) {
       case 'camBig':
       case 'camSmall':
       case 'camShow':
+      case 'camSwap':
       case 'camHide': {
-        const mode = c.type === 'camBig' ? 'big' : c.type === 'camHide' ? 'hidden' : 'small';
+        /** @type {CamMode} */
+        const mode = c.type === 'camBig' ? 'big' : c.type === 'camHide' ? 'hidden' : c.type === 'camSwap' ? 'swap' : 'small';
         // Start the move while you're still saying it, so it's part of the shot.
         camera.push({ src: clamp(t.start + 0.05), mode, by: c.id });
-        c.effect = mode === 'big' ? 'Your face fills the frame' : mode === 'hidden' ? 'Camera bubble hidden' : 'Camera bubble back in place';
+        c.effect = { big: 'Your face fills the frame', hidden: 'Camera bubble hidden', swap: 'You in front, the screen in the bubble', small: 'Camera bubble back in place' }[mode];
+        if (c.type === 'camSmall') closeBoards(t.start, true);
         break;
       }
+      case 'slide': {
+        closeBoards(t.start, false);
+        boards.push({ src0: clamp(t.start + 0.05), src1: Infinity, title: c.label || '', full: true, items: [], by: c.id });
+        c.effect = `A slide titled “${c.label}”`;
+        break;
+      }
+      case 'point': {
+        let b = boards.find((x) => x.src1 === Infinity);
+        if (!b) {
+          b = { src0: clamp(t.start + 0.05), src1: Infinity, title: null, full: false, items: [], by: c.id };
+          boards.push(b);
+        }
+        b.items.push({ src: clamp(t.start + 0.2), text: c.label || '', by: c.id });
+        c.effect = b.full ? `Bullet ${b.items.length} on the slide` : `Point ${b.items.length} on screen`;
+        break;
+      }
+      case 'endSlide':
+        c.effect = boards.some((x) => x.src1 === Infinity) ? 'Slide and points cleared' : 'No slide was showing';
+        closeBoards(t.start, true);
+        break;
     }
   }
   view.sort((a, b) => a.src - b.src);
+  // A slide nobody closed stays up to the end; a list of points fades 12s after its last point.
+  for (const b of boards) {
+    if (b.src1 !== Infinity) continue;
+    const last = b.items.length ? b.items[b.items.length - 1].src : b.src0;
+    b.src1 = b.full ? D : clamp(last + 12);
+  }
 
   // Narration is never fast-forwarded: if you talk during a speed-up, it
   // drops back to normal speed for what you say, then picks up again.
@@ -836,7 +979,7 @@ export function buildPlan(take, options = {}) {
     const words = W[i];
     const drop = new Set();
     for (const c of commands) if (c.phrase === i && c.type !== 'chapter' && c.type !== 'title') for (let k = c.span[0]; k <= c.span[1]; k++) drop.add(k);
-    if (live.some((c) => c.phrase === i && (c.type === 'chapter' || c.type === 'title'))) return;
+    if (live.some((c) => c.phrase === i && LABELLED.has(c.type))) return;
     /** @param {Word[]} line */
     const emit = (line) => {
       const out0 = toOut(line[0].start), out1 = toOut(line[line.length - 1].end);
@@ -881,6 +1024,11 @@ export function buildPlan(take, options = {}) {
     cut();
   });
   captions.sort((a, b) => a.out0 - b.out0);
+  // Show each line a beat before the voice (as subtitles do), never over the previous one.
+  for (let i = 0; i < captions.length; i++) {
+    const prevEnd = i ? captions[i - 1].out1 : 0;
+    captions[i].out0 = Math.max(prevEnd, captions[i].out0 - 0.15, 0);
+  }
   // Hold each line a moment after the voice stops, never into the next one.
   for (let i = 0; i < captions.length; i++) {
     const next = captions[i + 1];
@@ -921,6 +1069,7 @@ export function buildPlan(take, options = {}) {
     spots,
     chapters,
     title,
+    boards,
     marks: markSrc.map((m) => ({ ...m, out: toOut(m.src) })),
     camera: camera.sort((a, b) => a.src - b.src),
     camPath: take.camPath || [],

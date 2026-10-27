@@ -143,7 +143,8 @@ export class Recorder {
    * Ask for the screen, mic and camera, and start listening. Recording itself
    * starts with begin(), after the countdown, so the listener is already warm
    * and your first words ("big camera") are heard.
-   * @param {{lang: string, systemAudio: boolean, camera: boolean}} opts
+   * @param {{lang: string, systemAudio: boolean, camera: boolean, currentTab?: boolean}} opts
+   *   currentTab: record this very tab (Retake Studio records its own stage).
    */
   async prepare(opts) {
     this.lang = opts.lang;
@@ -151,7 +152,8 @@ export class Recorder {
       video: { frameRate: { ideal: 30 }, width: { max: 1920 }, height: { max: 1080 } },
       audio: opts.systemAudio,
       // @ts-ignore newer capture hints, ignored where unsupported
-      selfBrowserSurface: 'exclude',
+      preferCurrentTab: Boolean(opts.currentTab),
+      selfBrowserSurface: opts.currentTab ? 'include' : 'exclude',
       surfaceSwitching: 'include',
       systemAudio: opts.systemAudio ? 'include' : 'exclude',
     });
@@ -250,6 +252,8 @@ export class Recorder {
     this.t0 = performance.now();
     this.audioT0 = actx.currentTime;
     this.running = true;
+    for (const text of this.queued || []) this.typed(text);
+    this.queued = [];
     this.rec.start(1000);
     await started;
     if (camStarted) await camStarted;
@@ -328,6 +332,42 @@ export class Recorder {
       v.play().catch(() => {});
       this.motionTimer = setInterval(() => v.readyState >= 2 && sample(v), MOTION_EVERY * 1000);
     }
+  }
+
+  /**
+   * A command that arrived as text: typed, or dictated into Retake's command
+   * box with Wispr Flow (which types what you say into the focused field,
+   * far more accurately than the browser's recogniser). It's kept as a typed
+   * phrase; the planner finds the moment you said it from the mic.
+   * @param {string} text
+   * @param {number} [age] seconds since the text started arriving (Wispr types
+   *   right after you let go of its key; the box waits a moment for it to finish)
+   * @returns {import('./commands.js').Command[]} the commands it held
+   */
+  typed(text, age = 0) {
+    const clean = text.replace(/\s+/g, ' ').trim();
+    if (!clean) return [];
+    if (!this.running) {
+      // During the countdown: applied from the first frame, as a spoken "big camera" is.
+      if (!this.prep) return [];
+      const cmds = parseCommands([{ text: clean, start: 0, end: 0.3 }]);
+      if (cmds.length) (this.queued ||= []).push(clean);
+      return cmds;
+    }
+    const t = Math.max(0, this.now() - Math.max(0, age));
+    const phrase = { text: clean, start: Math.max(0, t - 0.4), end: t, typed: true };
+    const cmds = parseCommands([phrase]);
+    if (!cmds.length) return [];
+    if (this.paused) {
+      if (cmds.some((c) => c.type === 'resume')) this.resume();
+      if (cmds.some((c) => c.type === 'stop')) this.ev.onStopRequested?.();
+      return cmds;
+    }
+    this.phrases.push(phrase);
+    for (const c of cmds) this.ev.onCommand?.({ ...c, typed: true });
+    if (cmds.some((c) => c.type === 'pause')) this.pause();
+    if (cmds.some((c) => c.type === 'stop')) this.ev.onStopRequested?.();
+    return cmds;
   }
 
   /** Live speech recognition with phrase start/end times. */

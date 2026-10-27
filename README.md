@@ -24,18 +24,23 @@ Existing tools fix this **after** recording: you scrub a timeline, or an AI gues
 | **"cut the last two sentences"** / **"cut the last sentence"** | Cuts exactly that many sentences before the command. |
 | **"cut the last 5 seconds"** | Cuts exactly that much time before the command. |
 | **"cut from here"** … **"cut till here"** | Cuts everything between the two. |
-| **"hide that"** | Finds what just appeared on screen and pixelates it **from the moment it first appeared** (before you noticed) **until it leaves the screen**, or until you say **"show it"**. **"hide that for ten seconds"** sets the length. |
+| **"hide that"** | Finds what just appeared on screen and pixelates it **from the moment it first appeared** (before you noticed) until it leaves the screen, until you say **"show it"**, or for 6 seconds. **"hide that for ten seconds"** sets the length. |
 | **"hide the screen"** / **"show the screen"** | Blurs the whole screen, e.g. while you open your inbox. |
 | **"zoom in"** / **"zoom out"** | Glides to 2× on the centre, and back to the full screen, whatever is on screen. **"zoom in on the top right"** aims at a corner or side, **"zoom in more"** goes closer, **"zoom in for 3 seconds"** zooms back out on its own. |
 | **"look here"** | Dims the screen and rings what just changed, for three seconds. |
 | **"speed this up"** / **"normal speed"** | Fast-forwards the boring part (installs, builds, uploads). **"speed this up 8x"** sets the rate. |
 | **"pause"** / **"resume"** | Pauses the recording; nothing is recorded until you say "resume", and the join dissolves softly. |
 | **"stop recording"** | Ends the take and opens the editor. The command itself is left out. |
+| **"slide: why it matters"** | Puts up a full-screen slide with that title; your camera bubble stays on top. |
+| **"point: works offline"** | Adds a bullet: to the slide if one is up, otherwise as a list over the screen. **"end slide"** or **"clear the points"** takes it away. |
+| **"switch the screen"** / **"switch back"** | You fill the frame and the screen shrinks into a window where your bubble was. |
 | **"chapter: setup"** | Adds a chapter card on screen and a YouTube timestamp. |
 | **"title: my project"** | Opens the video with a title card. |
 | **"mark that"** | Drops a bookmark. |
 | **"big camera"** / **"small camera"** | Grows your camera bubble to fill the frame (intros, outros), then sends it back to its corner. |
 | **"hide camera"** / **"show camera"** | Gets your face out of the way when it covers something on screen. |
+
+**Direct with Wispr Flow.** Browser speech recognition can mishear a command. For the ones that must land exactly, click Retake's **command box** (on the recording slate, and floating with your camera), hold your Wispr Flow key and say it. Wispr types it perfectly, and Retake places it on the stretch of your voice that ended just before the text arrived (never on a sentence you'd already started), silences it, and drops the recogniser's misheard version. Any Retake page can send commands to the recorder the same way.
 
 **Eight languages, and the way people actually talk.** English, Hinglish, Hindi, Spanish, French, German, Portuguese and Italian (*kaat do*, *chhupa do*, *corta eso*, *acércate*, *cache ça*, *versteck das*, *Kapitel: …*). Everyday phrasings work too: "oops, let me say that again", "hold on", "one sec", "continue", "that's a wrap", "closer". Speech recognition often writes a lone "pause" as "pose" or "paws", so those count too, but only when said on their own. "Pause" also acts the moment it's heard, not when the recogniser finishes the phrase 1–2 seconds later.
 
@@ -54,8 +59,16 @@ And without being asked:
 
 ## Try it
 
-- **Sample take, no recording needed:** open the app and tap **Try the sample take** (or go to `/?sample`, or `/?sample&demo` to open it in the Demo version). It's a 72-second recording of a developer building a weather app, complete with dead air, a 20-second `npm install`, a pasted API key, a fumbled sentence and a tiny chart, and narration that directs Retake to fix all of it. Retake turns it into a 38-second video.
+- **Sample take, no recording needed, now with its narration:** open the app and tap **Try the sample take** (or go to `/?sample`, or `/?sample&demo` to open it in the Demo version). It's a 72-second recording of a developer building a weather app, complete with dead air, a 20-second `npm install`, a pasted API key, a fumbled sentence and a tiny chart, and narration that directs Retake to fix all of it. Retake turns it into a 38-second video.
 - **Your own take:** **Record a take** in Chrome or Edge on a computer, pick a window or tab, and talk.
+
+## Retake Studio (the demo video)
+
+`/studio.html` is how Retake's own demo video is made, with Retake:
+
+- **A stage** of animated scenes: the cost of editing, a cluttered traditional editor working itself into a frenzy, "Edit out loud", eight languages, Wispr Flow typing into Retake, and an end card. In the middle, a scripted tour of the **real Retake app**, in an iframe: the command list, the sample take, Final, Demo and Raw, the timeline, the Commands, Style and Export panels.
+- **A teleprompter** that floats over your windows: the current line, with commands highlighted, and what Retake just heard. Press → or Space (or a presentation clicker) for the next line.
+- **Retake records the Studio tab itself** with your camera, applies your spoken and Wispr-dictated commands live, and opens the take in the editor when you say "stop recording". Export the Demo version: one take, no editor.
 
 ## How it works
 
@@ -117,7 +130,7 @@ The plan is rebuilt from scratch whenever you flip a switch or change a setting,
 npm test
 ```
 
-44 tests on the command parser, motion analysis and planner, including:
+50 tests on the command parser, motion analysis and planner, including:
 
 - every direction in English, Hinglish and Devanagari Hindi;
 - ordinary narration ("this hides the sidebar", "the cut off date") is not mistaken for a direction;
@@ -131,13 +144,15 @@ npm test
 - Spanish, French, German, Portuguese and Italian; "pause" however the recogniser spells it, and only where the recording really paused;
 - words land where the voice is; captions follow the words and never overlap; the sound is already off when a silenced command starts;
 - fast-forward ramps keep time mapping exact and never speed up narration; zoom glides never jump; the Demo version never skips speech;
+- the Wispr Flow command box: a dictated command is timed from your voice, never from a sentence you'd already started, and wins over the recogniser's misheard version;
+- slides, points and switching the screen; "hide that" stops after a few seconds; "scratch that" never reaches past itself into the retake, and after a long sentence cuts only its last stretch;
 - real recogniser timing: a late final result never drags a command into the next sentence; "scratch that" works however the words are grouped, and the retake survives; camera commands run into a sentence work only with a pause; the product's name in a sentence isn't a command;
 - switching a direction off restores the footage;
 - source↔output time mapping round-trips exactly; SRT and YouTube chapter output;
 - camera directions build a timeline with smooth transitions, and are ignored inside ordinary sentences ("we bought a big camera");
 - the Demo version keeps commands audible, plays would-be cuts fast, and still reports the final cut's numbers.
 
-**End-to-end leak test.** A narrated take is synthesised with speech synthesis, with a faint 3150 Hz marker tone mixed into the command words only, and fed to Chromium as its microphone. A stand-in for the speech recogniser delivers phrases the way Chrome does (interim results 0.5s in, final results 1.3s after you stop, often merged with the next sentence). The take is recorded, planned and exported, and the exported audio is scanned for the marker: the raw export shows every command; the final export shows none, in both Smart and Cut modes.
+**End-to-end leak tests.** A narrated take is synthesised with speech synthesis, with a faint 3150 Hz marker tone mixed into the command words only, and fed to Chromium as its microphone. A stand-in for the speech recogniser delivers phrases the way Chrome does (interim results 0.5s in, final results 1.3s after you stop, often merged with the next sentence). The take is recorded, planned and exported, and the exported audio is scanned for the marker: the raw export shows every command; the final export shows none, in both Smart and Cut modes. A second test performs the whole Studio script (34 lines, 17 commands, two of them typed into the command box as Wispr Flow does, one misheard by the recogniser) and checks that every command lands, nothing leaks, and the captions are complete.
 
 The full app was also driven end to end in headless Chromium: the sample take, every effect rendered, undo, Raw/Retake comparison, a complete real-time export (checked with ffprobe), and a real recording using simulated screen, microphone and camera devices.
 

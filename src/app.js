@@ -17,6 +17,9 @@ const $ = (id) => /** @type {HTMLElement} */ (document.getElementById(id));
 /** @param {string} id */
 const input = (id) => /** @type {HTMLInputElement} */ (document.getElementById(id));
 
+/** Shown inside Retake Studio: silent, so it never plays into your mic. */
+const EMBED = new URLSearchParams(location.search).has('embed');
+
 /** Colour for each command in the UI. */
 const COLORS = {
   cut: 'var(--cut)', hide: 'var(--blur)', zoomIn: 'var(--zoom)', zoomOut: 'var(--zoom)', highlight: 'var(--spot)',
@@ -25,6 +28,7 @@ const COLORS = {
   cutSentences: 'var(--cut)', cutSeconds: 'var(--cut)', cutFrom: 'var(--cut)', cutTo: 'var(--cut)',
   unhide: 'var(--blur)', hideScreen: 'var(--blur)', showScreen: 'var(--blur)',
   pause: 'var(--rec)', resume: 'var(--rec)', stop: 'var(--rec)',
+  slide: 'var(--accent)', point: 'var(--accent)', endSlide: 'var(--accent)', camSwap: 'var(--cam)',
 };
 
 /** Other ways to say each command, shown on the help cards. */
@@ -37,6 +41,8 @@ const HINDI = {
   hideScreen: 'screen chhupa do · oculta la pantalla', showScreen: 'screen dikhao', pause: 'hold on · one sec · ruko · pausa',
   resume: 'continue · chalu karo · reprends', stop: 'that’s a wrap · recording band karo',
   cutSentences: 'last line kaat do · borra la última frase', cutSeconds: 'pichhle 5 second kaat do', unhide: 'ab dikhao',
+  slide: 'स्लाइड: … · diapositiva: … · Folie: …', point: 'पॉइंट: … · punto: … · Punkt: …', endSlide: 'clear the points · slide band karo',
+  camSwap: 'swap the view · screen badlo · switch back',
 };
 
 const DOES = {
@@ -64,6 +70,10 @@ const DOES = {
   pause: 'Pauses the recording. Nothing is recorded until you say “resume”.',
   resume: 'Picks the recording up again, with a soft dissolve at the join.',
   stop: 'Ends the recording and opens the editor.',
+  slide: 'Puts up a full-screen slide with that title. Your bubble stays on top.',
+  point: 'Adds a bullet: to the slide if one is up, or as a list over the screen.',
+  endSlide: 'Takes the slide or the points away. “Back to the screen” works too.',
+  camSwap: 'You fill the frame and the screen shrinks into a window. “Switch back” undoes it.',
 };
 
 const GROUPS = {
@@ -73,6 +83,7 @@ const GROUPS = {
   Time: 'Control time',
   Recording: 'Control the recording',
   Structure: 'Give it structure',
+  Slides: 'Slides, said into being',
   You: 'Your camera bubble',
 };
 
@@ -276,7 +287,7 @@ function logCommand(c) {
   what.textContent = describe(c);
   const heard = document.createElement('span');
   heard.className = 'heard';
-  heard.textContent = `you said “${c.heard}”`;
+  heard.textContent = /** @type {any} */ (c).typed ? `via the command box: “${c.heard}”` : `you said “${c.heard}”`;
   what.append(heard);
   const when = document.createElement('span');
   when.className = 'when';
@@ -323,6 +334,49 @@ let pathTimer;
  * being recorded, the bubble's position is tracked and the final video's
  * bubble follows it.
  */
+/**
+ * A command box: text typed into it, or dictated into it with Wispr Flow
+ * (which types what you say into the focused field), goes to the recorder as
+ * a command. Wispr pastes the whole phrase at once, so it's sent on Enter or
+ * after a short pause in the typing.
+ * @param {HTMLInputElement} box @param {HTMLFormElement | null} form
+ */
+function wireDirector(box, form) {
+  let timer = 0, firstAt = 0;
+  const send = () => {
+    clearTimeout(timer);
+    const text = box.value.trim();
+    if (!text) return;
+    box.value = '';
+    const age = firstAt ? (performance.now() - firstAt) / 1000 : 0;
+    firstAt = 0;
+    const cmds = recorder?.typed(text, age) ?? [];
+    box.placeholder = cmds.length ? `✓ ${describe(cmds[0])}` : `Not a command: “${text}”`;
+  };
+  form?.addEventListener('submit', (e) => {
+    e.preventDefault();
+    send();
+  });
+  box.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      send();
+    }
+  });
+  box.addEventListener('input', () => {
+    if (!firstAt && box.value) firstAt = performance.now();
+    clearTimeout(timer);
+    timer = window.setTimeout(send, 900);
+  });
+}
+
+/** Commands from other Retake pages (another tab, the demo stage) arrive here too. */
+const directorChannel = 'BroadcastChannel' in window ? new BroadcastChannel('retake-director') : null;
+directorChannel?.addEventListener('message', (e) => {
+  const text = typeof e.data?.text === 'string' ? e.data.text : '';
+  if (text && recorder) recorder.typed(text, Number(e.data?.age) || 0);
+});
+
 async function floatCamera() {
   const dpip = /** @type {any} */ (window).documentPictureInPicture;
   if (!dpip) {
@@ -333,7 +387,7 @@ async function floatCamera() {
     toast('Turn on “Show me in a bubble” before recording to float your camera.');
     return;
   }
-  pip = await dpip.requestWindow({ width: 220, height: 220 });
+  pip = await dpip.requestWindow({ width: 240, height: 300 });
   const doc = /** @type {Window} */ (pip).document;
   doc.documentElement.classList.add('pip-bubble');
   for (const link of document.querySelectorAll('link[rel="stylesheet"]')) doc.head.append(link.cloneNode());
@@ -345,6 +399,13 @@ async function floatCamera() {
   v.srcObject = recorder.camStream;
   doc.body.append(v);
   v.play().catch(() => {});
+  // The command box floats with you, so Wispr Flow can type into it from any app.
+  const box = doc.createElement('input');
+  box.className = 'pip-director';
+  box.placeholder = 'Command (Wispr Flow)';
+  box.spellcheck = false;
+  doc.body.append(box);
+  wireDirector(/** @type {HTMLInputElement} */ (box), null);
   const w = /** @type {Window} */ (pip);
   if (recorder.surface === 'monitor') {
     const r = recorder;
@@ -386,7 +447,15 @@ async function openTake(take) {
   /** @type {import('./player.js').Source} */
   let source;
   if (take.kind === 'sample') {
-    source = new SampleSource();
+    const ss = new SampleSource();
+    // The sample's narration: optional, the sample still plays without it.
+    try {
+      const res = await fetch('assets/sample-voice.mp3');
+      if (res.ok) /** @type {any} */ (ss).blob = await res.blob();
+    } catch {
+      /* offline: a silent sample */
+    }
+    source = ss;
     $('take-kind').textContent = 'The sample take · a developer demoing a weather app';
   } else {
     const vs = new VideoSource(take.blob, take.duration);
@@ -418,6 +487,7 @@ async function openTake(take) {
 
   rebuild();
   const player = new Player(canvas, source, currentPlan, () => state.look);
+  if (EMBED) player.mute();
   state.player = player;
   player.onTime = (o) => renderTime(o);
   player.onEnd = () => setPlaying(false);
@@ -505,7 +575,8 @@ function renderBands() {
   };
   const camBig = [];
   for (let i = 0; i < plan.camera.length; i++) {
-    if (plan.camera[i].mode === 'big') camBig.push(band('cam', plan.camera[i].src, plan.camera[i + 1]?.src ?? D, 'Big camera'));
+    const m = plan.camera[i].mode;
+    if (m === 'big' || m === 'swap') camBig.push(band('cam', plan.camera[i].src, plan.camera[i + 1]?.src ?? D, m === 'big' ? 'Big camera' : 'Switched: you in front'));
   }
   $('bands').replaceChildren(
     ...plan.cuts.map((c) => band(c.reason === 'dead-air' ? 'air' : 'cut', c.src0, c.src1, c.reason === 'dead-air' ? 'Dead air trimmed' : c.reason === 'command' ? 'Spoken command removed' : c.reason === 'stop' ? 'After “stop recording”' : 'Cut')),
@@ -515,6 +586,7 @@ function renderBands() {
     ...plan.blurs.map((b) => band('blur', b.src0, b.src1, 'Hidden')),
     ...plan.spots.map((s) => band('spot', s.src0, s.src1, 'Spotlight')),
     ...camBig,
+    ...(plan.boards || []).map((b) => band('slide', b.src0, b.src1, b.full ? `Slide: ${b.title}` : `${b.items.length} points`)),
     ...plan.chapters.map((c) => band('chap', c.src, c.src, `Chapter: ${c.title}`)),
   );
 }
@@ -930,6 +1002,7 @@ async function init() {
   $('record').addEventListener('click', startRecording);
   $('stop').addEventListener('click', stopRecording);
   $('pop-out').addEventListener('click', floatCamera);
+  wireDirector(input('director'), /** @type {HTMLFormElement} */ ($('director-form')));
   $('pause').addEventListener('click', () => (recorder?.paused ? recorder.resume() : recorder?.pause()));
   $('count-cancel').addEventListener('click', cancelCountdown);
   $('try-sample').addEventListener('click', async () => {
@@ -993,6 +1066,18 @@ async function init() {
   $('export-cancel').addEventListener('click', () => state.exporting?.abort());
   $('dl-srt').addEventListener('click', () => download(new Blob([toSrt(currentPlan().captions)], { type: 'text/plain' }), `${baseName()}.srt`));
   $('dl-vtt').addEventListener('click', () => download(new Blob([toVtt(currentPlan().captions)], { type: 'text/vtt' }), `${baseName()}.vtt`));
+  $('dl-take').addEventListener('click', () => {
+    const t = state.take;
+    if (!t) return;
+    // Everything the planner used, without the video: enough to reproduce a timing problem.
+    const data = {
+      app: 'retake', version: 1, duration: t.duration, phrases: t.phrases, joins: t.joins || [], cameraStart: /** @type {any} */ (t).cameraStart,
+      levels: { dt: t.levels.dt, values: Array.from(t.levels.values, (v) => Math.round(v * 10000) / 10000) },
+      motion: (t.motion || []).map((m) => ({ t: m.t, count: m.count })),
+      options: options(),
+    };
+    download(new Blob([JSON.stringify(data)], { type: 'application/json' }), `${baseName()}-timing.json`);
+  });
   $('dl-txt').addEventListener('click', () => {
     const text = currentPlan().captions.map((c) => `[${fmt(c.out0)}] ${c.text}`).join('\n');
     download(new Blob([text], { type: 'text/plain' }), `${baseName()}-transcript.txt`);
@@ -1016,9 +1101,13 @@ async function init() {
     }
   });
 
-  // Deep links for judges: ?sample opens the sample take; ?sample&demo opens it in Demo view.
+  // Deep links: ?sample opens the sample take (&demo in Demo view); ?last opens
+  // the last take (Retake Studio sends you there when you stop).
   const q = new URLSearchParams(location.search);
-  if (q.has('sample')) {
+  if (q.has('last')) {
+    const t = await loadTake();
+    if (t) await openTake(t);
+  } else if (q.has('sample')) {
     await openTake(buildSampleTake());
     if (q.has('demo')) await setView('demo');
   }
@@ -1027,4 +1116,4 @@ async function init() {
 void init();
 
 // Exposed for automated checks.
-/** @type {any} */ (window).retake = { state, stripCommands, setView };
+/** @type {any} */ (window).retake = { state, stripCommands, setView, rebuild, selectTab, openSample: () => openTake(buildSampleTake()), togglePlay };
